@@ -1,4 +1,4 @@
-require("dotenv").config();
+require("dotenv").config({ quiet: true });
 
 const axios = require("axios");
 const Agent = require("agentkeepalive");
@@ -35,23 +35,167 @@ axios.defaults.httpsAgent = httpsAgent;
 axios.defaults.timeout = 600000;
 
 // ============================================================
-//  TALLY + POSTGRES CONFIG (env vars)
+//  TALLY + DATABASE CONFIG
 // ============================================================
 // Tally Prime HTTP endpoint (ODBC / XML interface) on port 9000
 const TALLY_URL = "http://localhost:9000";
 
-const pgConfig = {
-  host: process.env.PG_HOST || "localhost",
-  port: Number(process.env.PG_PORT) || 5432,
-  user: process.env.PG_USER,
-  password: process.env.PG_PASSWORD,
-  database: process.env.PG_DATABASE,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000
-};
+let pool = null;
 
-const pool = new Pool(pgConfig);
+const DB_CONFIG_FILE = path.join(os.homedir(), "tally-agent-db-config.enc");
+
+// Derive a machine-local encryption key (so the stored file is encrypted at rest)
+function getEncryptionKey() {
+  const seed = `${os.hostname()}|${os.platform()}|${os.arch()}|${os.userInfo().username}`;
+  return crypto.scryptSync(seed, "tally-agent-config-v1", 32);
+}
+
+function encryptConfig(obj) {
+  const key = getEncryptionKey();
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const data = Buffer.from(JSON.stringify(obj), "utf8");
+  const enc = Buffer.concat([cipher.update(data), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return JSON.stringify({
+    v: 1,
+    iv: iv.toString("base64"),
+    tag: tag.toString("base64"),
+    data: enc.toString("base64")
+  });
+}
+
+function decryptConfig(raw) {
+  const key = getEncryptionKey();
+  const parsed = JSON.parse(raw);
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    key,
+    Buffer.from(parsed.iv, "base64")
+  );
+  decipher.setAuthTag(Buffer.from(parsed.tag, "base64"));
+  const dec = Buffer.concat([
+    decipher.update(Buffer.from(parsed.data, "base64")),
+    decipher.final()
+  ]);
+  return JSON.parse(dec.toString("utf8"));
+}
+
+function saveDbConfig(cfg) {
+  fs.writeFileSync(DB_CONFIG_FILE, encryptConfig(cfg));
+}
+
+function loadDbConfig() {
+  if (!fs.existsSync(DB_CONFIG_FILE)) return null;
+  try {
+    return decryptConfig(fs.readFileSync(DB_CONFIG_FILE, "utf8"));
+  } catch (err) {
+    console.log("⚠️ Could not decrypt saved config. Starting wizard.");
+    return null;
+  }
+}
+
+function buildPoolConfig(cfg) {
+  if (cfg.connectionString) {
+    return {
+      connectionString: cfg.connectionString,
+      max: 20,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000
+    };
+  }
+  return {
+    host: cfg.host || "localhost",
+    port: Number(cfg.port) || 5432,
+    user: cfg.user,
+    password: cfg.password,
+    database: cfg.database,
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
+  };
+}
+
+async function testDbConnection(cfg) {
+  const testPool = new Pool(buildPoolConfig(cfg));
+  try {
+    await testPool.query("SELECT 1");
+    return true;
+  } catch (err) {
+    return false;
+  } finally {
+    await testPool.end();
+  }
+}
+
+async function connectWithConfig(cfg) {
+  if (pool) {
+    await pool.end().catch(() => {});
+  }
+  pool = new Pool(buildPoolConfig(cfg));
+  await initDb();
+}
+
+/* --------------------------
+   DATABASE CONFIG WIZARD
+---------------------------- */
+async function dbWizard() {
+  console.log("\n🛠️  Database Configuration Wizard");
+  console.log("======================================");
+
+  while (true) {
+    const mode = await askQuestion(
+      "\nDatabase type — [1] Local PostgreSQL, [2] External PostgreSQL: "
+    );
+
+    let cfg = { mode: mode === "2" ? "external" : "local" };
+
+    if (mode === "2") {
+      const useUrl = (await askQuestion("Use a connection URL? [y/N]: ")).trim().toLowerCase();
+      if (useUrl === "y") {
+        cfg.connectionString = await askQuestion(
+          "Connection URL (postgres://user:pass@host:port/db): "
+        );
+      } else {
+        cfg.host = await askQuestion("Host: ");
+        cfg.port = (await askQuestion("Port [5432]: ")) || "5432";
+        cfg.database = await askQuestion("Database name: ");
+        cfg.user = await askQuestion("Username: ");
+        cfg.password = await askQuestion("Password: ", true);
+      }
+    } else {
+      cfg.host = (await askQuestion("Host [localhost]: ")) || "localhost";
+      cfg.port = (await askQuestion("Port [5432]: ")) || "5432";
+      cfg.database = await askQuestion("Database name: ");
+      cfg.user = await askQuestion("Username: ");
+      cfg.password = await askQuestion("Password: ", true);
+    }
+
+    console.log("\n🔌 Testing connection...");
+    if (await testDbConnection(cfg)) {
+      console.log("✅ Connection successful!");
+      saveDbConfig(cfg);
+      console.log("🔐 Configuration saved securely (encrypted) for next launch.\n");
+      return cfg;
+    }
+
+    console.log("❌ Connection failed. Please check the details and try again.\n");
+  }
+}
+
+/* --------------------------
+   MAIN MENU
+---------------------------- */
+async function mainMenu() {
+  console.log("\n================= TALLY AGENT =================");
+  console.log("  [1] Start Sync");
+  console.log("  [2] Database Settings (Change Database Configuration)");
+  console.log("  [3] Exit");
+  console.log("=================================================");
+
+  const choice = (await askQuestion("\nSelect an option: ")).trim();
+  return choice;
+}
 
 // ============================================================
 //  APP STATE
@@ -1725,33 +1869,16 @@ async function selectCompanies(allCompanies) {
 }
 
 // ============================================================
-//  BOOTSTRAP
+//  SYNC FLOW (company selection + timer + sync loop)
 // ============================================================
-(async () => {
-  console.log("\n🟢 Tally → Postgres Direct Agent starting...\n");
-
-  // Validate DB env config
-  if (!pgConfig.user || !pgConfig.database) {
-    console.error(
-      "❌ Missing Postgres config. Set PG_USER, PG_DATABASE (and optionally PG_HOST, PG_PORT, PG_PASSWORD)."
-    );
-    process.exit(1);
-  }
-
-  try {
-    await initDb();
-  } catch (err) {
-    console.error("❌ Database connection failed:", err.message);
-    process.exit(1);
-  }
-
+async function runSyncFlow() {
   try {
     // Step 1: Detect companies + auto-create in DB
     const companies = await detectCompanies();
 
     if (!companies.length) {
       console.error("❌ No companies found in Tally.");
-      process.exit(1);
+      return;
     }
 
     // Step 2: Let the user pick one company or ALL
@@ -1782,8 +1909,61 @@ async function selectCompanies(allCompanies) {
     }
   } catch (err) {
     console.error("⛔ FATAL ERROR:", err.message);
-    process.exit(1);
-  } finally {
-    await pool.end();
   }
+}
+
+// ============================================================
+//  BOOTSTRAP
+// ============================================================
+(async () => {
+  console.log("\n🟢 Tally → Postgres Direct Agent starting...\n");
+
+  // ── Step 1: Connect to database ──────────────────────────
+  let cfg = loadDbConfig();
+
+  if (cfg) {
+    console.log("📂 Saved database configuration found. Connecting...");
+    try {
+      await connectWithConfig(cfg);
+      console.log("✅ Connected automatically to the saved database.\n");
+    } catch (err) {
+      console.log(`⚠️ Could not connect using the saved configuration: ${err.message}`);
+      console.log("Please update your database settings.\n");
+      cfg = await dbWizard();
+      await connectWithConfig(cfg);
+      console.log("✅ Connected with new settings.\n");
+    }
+  } else {
+    console.log("🛠️ First launch detected — let's set up your database.\n");
+    cfg = await dbWizard();
+    await connectWithConfig(cfg);
+  }
+
+  // ── Step 2: Main menu loop ───────────────────────────────
+  let running = true;
+
+  while (running) {
+    const choice = await mainMenu();
+
+    if (choice === "1") {
+      await runSyncFlow();
+    } else if (choice === "2") {
+      console.log("\n🛠️ Change Database Configuration\n");
+      const newCfg = await dbWizard();
+      try {
+        await connectWithConfig(newCfg);
+        console.log("✅ Database switched successfully.\n");
+      } catch (err) {
+        console.error(`❌ Could not connect with the new settings: ${err.message}`);
+      }
+    } else if (choice === "3") {
+      running = false;
+    } else {
+      console.log("⚠️ Invalid option. Please choose 1, 2 or 3.");
+    }
+  }
+
+  await pool.end();
+  console.log("👋 Goodbye!");
+  process.exit(0);
 })();
