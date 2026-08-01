@@ -313,10 +313,25 @@ CREATE TABLE IF NOT EXISTS sync_log (
 );
 `;
 
+// Add raw JSON payload column to every table (works for existing DBs too)
+const PAYLOAD_COLUMNS = `
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS payload JSONB;
+ALTER TABLE ledgers ADD COLUMN IF NOT EXISTS payload JSONB;
+ALTER TABLE vouchers ADD COLUMN IF NOT EXISTS payload JSONB;
+ALTER TABLE voucher_entries ADD COLUMN IF NOT EXISTS payload JSONB;
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payload JSONB;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payload JSONB;
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS payload JSONB;
+ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS payload JSONB;
+ALTER TABLE inventory_movements ADD COLUMN IF NOT EXISTS payload JSONB;
+ALTER TABLE profit_loss ADD COLUMN IF NOT EXISTS payload JSONB;
+`;
+
 async function initDb() {
   const client = await pool.connect();
   try {
     await client.query(SCHEMA);
+    await client.query(PAYLOAD_COLUMNS);
     console.log("✅ Database tables ready");
   } finally {
     client.release();
@@ -422,16 +437,16 @@ async function detectCompanies() {
 
     if (!company_guid || !name) continue;
 
-    companyList.push({ company_guid, name });
+    companyList.push({ company_guid, name, payload: c });
   }
 
   // 🔥 Auto-create companies in DB (duplicate-free upsert)
   await upsertRows({
     table: "companies",
-    columns: ["company_guid", "name"],
+    columns: ["company_guid", "name", "payload"],
     rows: companyList,
     conflict: ["company_guid"],
-    updateColumns: ["name"]
+    updateColumns: ["name", "payload"]
   });
 
   console.log(
@@ -577,7 +592,8 @@ async function syncLedgers(company) {
       type: l.ISBILLWISEON === "Yes" ? "Party" : "General",
       phone,
       email,
-      pan
+      pan,
+      payload: l
     });
   }
 
@@ -593,7 +609,8 @@ async function syncLedgers(company) {
       "type",
       "phone",
       "email",
-      "pan"
+      "pan",
+      "payload"
     ],
     rows: ledgerRows,
     conflict: ["company_guid", "ledger_guid"],
@@ -605,7 +622,8 @@ async function syncLedgers(company) {
       "type",
       "phone",
       "email",
-      "pan"
+      "pan",
+      "payload"
     ]
   });
 
@@ -724,7 +742,8 @@ async function syncVouchers() {
         voucher_guid: voucherGuid,
         ledger_name: ledgerName,
         amount: Math.abs(Number(amountRaw)),
-        is_debit: isDebit
+        is_debit: isDebit,
+        payload: e
       });
     }
 
@@ -734,7 +753,8 @@ async function syncVouchers() {
         voucher_guid: voucherGuid,
         ledger_name: extractValue(v.PARTYLEDGERNAME?.[0]),
         amount: 0,
-        is_debit: false
+        is_debit: false,
+        payload: v
       });
     }
 
@@ -753,7 +773,8 @@ async function syncVouchers() {
       voucher_date: voucherDate,
       voucher_type: voucherType,
       reference_no: referenceNo,
-      net_amount: netAmount
+      net_amount: netAmount,
+      payload: v
     });
 
     entryRows.push(...entries);
@@ -773,7 +794,8 @@ async function syncVouchers() {
         invoice_date: voucherDate,
         invoice_type: isPurchase ? "Purchase" : "Sales",
         party_name: extractValue(v.PARTYLEDGERNAME?.[0]),
-        total_amount: netAmount
+        total_amount: netAmount,
+        payload: v
       });
     }
   }
@@ -790,11 +812,18 @@ async function syncVouchers() {
         "voucher_date",
         "voucher_type",
         "reference_no",
-        "net_amount"
+        "net_amount",
+        "payload"
       ],
       rows: voucherRows,
       conflict: ["company_guid", "voucher_guid"],
-      updateColumns: ["voucher_date", "voucher_type", "reference_no", "net_amount"]
+      updateColumns: [
+        "voucher_date",
+        "voucher_type",
+        "reference_no",
+        "net_amount",
+        "payload"
+      ]
     });
 
     const invoiceCount = await upsertRows({
@@ -806,11 +835,19 @@ async function syncVouchers() {
         "invoice_date",
         "invoice_type",
         "party_name",
-        "total_amount"
+        "total_amount",
+        "payload"
       ],
       rows: invoiceRows,
       conflict: ["company_guid", "invoice_guid"],
-      updateColumns: ["invoice_no", "invoice_date", "invoice_type", "party_name", "total_amount"]
+      updateColumns: [
+        "invoice_no",
+        "invoice_date",
+        "invoice_type",
+        "party_name",
+        "total_amount",
+        "payload"
+      ]
     });
 
     // 🔥 Rebuild entries for the synced vouchers (no duplicates)
@@ -825,7 +862,7 @@ async function syncVouchers() {
       const placeholders = entryRows
         .map(
           (_, i) =>
-            `($${i * 5 + 1}, $${i * 5 + 2}, $${i * 5 + 3}, $${i * 5 + 4}, $${i * 5 + 5})`
+            `($${i * 6 + 1}, $${i * 6 + 2}, $${i * 6 + 3}, $${i * 6 + 4}, $${i * 6 + 5}, $${i * 6 + 6})`
         )
         .join(",");
       const values = entryRows.flatMap((r) => [
@@ -833,10 +870,11 @@ async function syncVouchers() {
         r.voucher_guid,
         r.ledger_name,
         r.amount,
-        r.is_debit
+        r.is_debit,
+        r.payload
       ]);
       await client.query(
-        `INSERT INTO voucher_entries (company_guid, voucher_guid, ledger_name, amount, is_debit)
+        `INSERT INTO voucher_entries (company_guid, voucher_guid, ledger_name, amount, is_debit, payload)
          VALUES ${placeholders}`,
         values
       );
@@ -947,7 +985,8 @@ async function syncBills() {
         ledgerName,
         pendingAmt,
         dueDate
-      )
+      ),
+      payload: bill
     });
   }
 
@@ -963,11 +1002,21 @@ async function syncBills() {
       "due_date",
       "overdue_days",
       "bill_type",
-      "source_hash"
+      "source_hash",
+      "payload"
     ],
     rows,
     conflict: ["company_guid", "source_hash"],
-    updateColumns: []
+    updateColumns: [
+      "ledger_name",
+      "bill_date",
+      "bill_amount",
+      "pending_amount",
+      "due_date",
+      "overdue_days",
+      "bill_type",
+      "payload"
+    ]
   });
 
   await logSync("bills_receivable", synced);
@@ -1060,7 +1109,8 @@ async function syncBillsPayable() {
         ledgerName,
         pendingAmt,
         dueDate
-      )
+      ),
+      payload: bill
     });
   }
 
@@ -1076,11 +1126,20 @@ async function syncBillsPayable() {
       "due_date",
       "overdue_days",
       "bill_type",
-      "source_hash"
+      "source_hash",
+      "payload"
     ],
     rows,
     conflict: ["company_guid", "source_hash"],
-    updateColumns: []
+    updateColumns: [
+      "ledger_name",
+      "bill_date",
+      "bill_amount",
+      "pending_amount",
+      "due_date",
+      "bill_type",
+      "payload"
+    ]
   });
 
   await logSync("bills_payable", synced);
@@ -1169,7 +1228,8 @@ async function syncOrders() {
       order_date: toISODate(normalizeText(v.DATE?.[0])),
       party_name: normalizeText(v.PARTYLEDGERNAME?.[0]),
       total_amount: parseTallyNumber(v.AMOUNT?.[0] || "0"),
-      type: voucherType === "Sales Order" ? "Sales" : "Purchase"
+      type: voucherType === "Sales Order" ? "Sales" : "Purchase",
+      payload: v
     });
   }
 
@@ -1182,11 +1242,19 @@ async function syncOrders() {
       "order_date",
       "party_name",
       "total_amount",
-      "type"
+      "type",
+      "payload"
     ],
     rows,
     conflict: ["company_guid", "order_guid"],
-    updateColumns: ["order_no", "order_date", "party_name", "total_amount", "type"]
+    updateColumns: [
+      "order_no",
+      "order_date",
+      "party_name",
+      "total_amount",
+      "type",
+      "payload"
+    ]
   });
 
   await cleanupByGuids("orders", ACTIVE_COMPANY_GUID, "order_guid", orderGuids);
@@ -1270,7 +1338,8 @@ async function fetchFullStockData() {
       opening_qty: parseTallyNumber(i.OPENINGBALANCE?.[0]),
       opening_value: parseTallyNumber(i.OPENINGVALUE?.[0]),
       closing_qty: parseTallyNumber(i.CLOSINGBALANCE?.[0]),
-      closing_value: parseTallyNumber(i.CLOSINGVALUE?.[0])
+      closing_value: parseTallyNumber(i.CLOSINGVALUE?.[0]),
+      payload: i
     });
   }
 
@@ -1285,7 +1354,8 @@ async function fetchFullStockData() {
       "opening_qty",
       "opening_value",
       "closing_qty",
-      "closing_value"
+      "closing_value",
+      "payload"
     ],
     rows,
     conflict: ["company_guid", "item_guid"],
@@ -1296,7 +1366,8 @@ async function fetchFullStockData() {
       "opening_qty",
       "opening_value",
       "closing_qty",
-      "closing_value"
+      "closing_value",
+      "payload"
     ]
   });
 
@@ -1413,7 +1484,8 @@ async function syncInventoryMovements() {
         movement_type: movementType,
         voucher_type: voucherType,
         voucher_date: voucherDate,
-        source_hash
+        source_hash,
+        payload: e
       });
     }
   }
@@ -1427,11 +1499,19 @@ async function syncInventoryMovements() {
       "movement_type",
       "voucher_type",
       "voucher_date",
-      "source_hash"
+      "source_hash",
+      "payload"
     ],
     rows,
     conflict: ["company_guid", "source_hash"],
-    updateColumns: []
+    updateColumns: [
+      "item_name",
+      "qty",
+      "movement_type",
+      "voucher_type",
+      "voucher_date",
+      "payload"
+    ]
   });
 
   await logSync("inventory_movements", synced);
@@ -1514,7 +1594,13 @@ async function syncProfitLossMonthly() {
             from_date: toISODate(fromDate),
             to_date: toISODate(toDate),
             net_amount: Math.abs(netAmount),
-            type
+            type,
+            payload: {
+              from_date: fromDate,
+              to_date: toDate,
+              net_amount: netAmount,
+              type
+            }
           }
         ];
 
@@ -1526,11 +1612,12 @@ async function syncProfitLossMonthly() {
             "from_date",
             "to_date",
             "net_amount",
-            "type"
+            "type",
+            "payload"
           ],
           rows,
           conflict: ["company_guid", "month"],
-          updateColumns: ["from_date", "to_date", "net_amount", "type"]
+          updateColumns: ["from_date", "to_date", "net_amount", "type", "payload"]
         });
 
         await logSync("profit_loss", synced);
