@@ -1,0 +1,2566 @@
+
+const express = require("express");
+const app = express();
+
+app.use(express.json());
+
+app.listen(5001, () => {
+});
+const axios = require("axios");
+
+const Agent = require("agentkeepalive");
+
+// HTTP agent (for http://localhost etc)
+const httpAgent = new Agent({
+  maxSockets: 100,
+  maxFreeSockets: 10,
+  timeout: 60000,
+  freeSocketTimeout: 30000
+});
+
+// HTTPS agent (for https:// APIs)
+const httpsAgent = new Agent.HttpsAgent({
+  maxSockets: 100,
+  maxFreeSockets: 10,
+  timeout: 60000,
+  freeSocketTimeout: 30000
+});
+
+axios.defaults.httpAgent = httpAgent;
+axios.defaults.httpsAgent = httpsAgent;
+
+// Increase timeout to avoid large XML timeout
+axios.defaults.timeout = 600000; 
+
+const xml2js = require("xml2js");
+const { parseStringPromise } = require("xml2js");
+const fs = require("fs");
+const crypto = require("crypto");
+const readline = require("readline");
+const path = require("path");
+const os = require("os");
+const { exec } = require("child_process");
+const DEBUG = false;
+function formatDuration(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  return `${hours}h ${minutes}m ${seconds}s`;
+}
+
+const PLAN_SYNC_INTERVALS = {
+  Starter: 2 * 60 * 60 * 1000,      // 2 hours
+  Pro: 60 * 60 * 1000,              // 1 hour
+  Business: 30 * 60 * 1000,         // 30 min
+  Enterprise: 1 * 60 * 1000         // 5 min
+};
+
+async function cleanupMissing(entity, idField, existingIds, company_guid) {
+  if (!existingIds.length) {
+    console.log(`⚠️ Skipping cleanup for ${entity} (empty list)`);
+    return;
+  }
+
+  await axios.post(
+    `${BACKEND_URL}/cleanup/${entity}`,
+    {
+      company_guid,
+      existing_ids: existingIds,
+      id_field: idField
+    },
+    authHeaders()
+  );
+
+  console.log(`🧹 Cleanup completed for ${entity}`);
+}
+
+axios.interceptors.response.use(
+  res => res,
+  err => {
+
+    console.error("\n❌ AXIOS ERROR");
+    console.error("URL:", err.config?.url);
+    console.error("METHOD:", err.config?.method);
+    console.error("MESSAGE:", err.message);
+    console.error("STATUS:", err.response?.status);
+    console.error("====================================");
+
+    throw err;
+  }
+);
+
+async function getLicensePlan() {
+  try {
+    if (!ADMIN_EMAIL) {
+      console.log("⚠️ No admin email. Defaulting to Starter.");
+      return "Starter";
+    }
+
+    const res = await axios.get(
+      `https://license-system-v6ht.onrender.com/api/external/actve-license/${ADMIN_EMAIL}?productId=695902cfc240b17f16c3d716`
+    );
+
+    const plan =
+      res.data?.activeLicense?.licenseTypeId?.name;
+
+    if (!plan) {
+      console.log("⚠️ No active license found. Defaulting to Starter.");
+      return "Starter";
+    }
+
+    return plan;
+
+  } catch (err) {
+    console.log("⚠️ License API failed. Defaulting to Starter.");
+    return "Starter";
+  }
+}
+
+
+function extractAddressValue(addr) {
+  if (!addr) return null;
+
+  // ADDRESS as array
+  if (Array.isArray(addr)) {
+    return addr
+      .map(a => (typeof a === "object" ? a._ : a))
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  // ADDRESS as object { _: value }
+  if (typeof addr === "object" && addr._) {
+    return addr._;
+  }
+
+  // ADDRESS as string
+  return String(addr);
+}
+
+// 🔎 Smart extractors
+function normalizeText(value) {
+  if (!value) return null;
+
+  // If array → join
+  if (Array.isArray(value)) {
+    return value.join(" ");
+  }
+
+  // If object with "_" (Tally XML pattern)
+  if (typeof value === "object" && value._) {
+    return value._;
+  }
+
+  // If string or number
+  return String(value);
+}
+function extractPhone(text) {
+  const str = normalizeText(text);
+  if (!str) return null;
+
+  const matches = str.match(/\b[6-9]\d{9}\b/g);
+  return matches ? matches[0] : null;
+}
+
+
+
+
+function extractEmail(text) {
+  const str = normalizeText(text);
+  if (!str) return null;
+
+  const match = str.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return match ? match[0] : null;
+}
+
+
+
+function askQuestion(query, hideInput = false) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  if (hideInput) {
+    process.stdout.write(query);
+    process.stdin.setRawMode(true);
+    let input = "";
+
+    process.stdin.on("data", (char) => {
+      char = char.toString();
+      if (char === "\n" || char === "\r") {
+        process.stdin.setRawMode(false);
+        rl.close();
+        console.log();
+        rl.removeAllListeners();
+        return;
+      }
+      if (char === "\u0003") process.exit();
+      input += char;
+    });
+
+    return new Promise((resolve) => {
+      rl.on("close", () => resolve(input));
+    });
+  }
+
+  return new Promise((resolve) =>
+    rl.question(query, (answer) => {
+      rl.close();
+      resolve(answer);
+    })
+  );
+}
+
+let ACTIVE_COMPANY_GUID = null;
+let AUTH_TOKEN = null;
+//const STATE_FILE = "./agent-sync-state.json";
+let ACTIVE_COMPANY_NAME = null;
+let ADMIN_EMAIL = null; 
+let isSyncRunning = false;
+
+const STATE_FILE = path.join(
+  os.homedir(),
+  "tally-agent-state.json"
+);
+
+
+function authHeaders() {
+  return {
+    headers: {
+      Authorization: `Bearer ${AUTH_TOKEN}`
+    }
+  };
+}
+
+function openDefaultBrowser(url) {
+  return new Promise((resolve, reject) => {
+    let command;
+    if (process.platform === "win32") {
+      command = `start "" "${url}"`;
+    } else if (process.platform === "darwin") {
+      command = `open "${url}"`;
+    } else {
+      command = `xdg-open "${url}"`;
+    }
+
+    exec(command, (error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+async function handleForgotPassword() {
+  const resetUrl = "https://tally-connect.com/forgot-password";
+  try {
+    await openDefaultBrowser(resetUrl);
+    console.log("\nOpening your default browser...\n");
+    console.log("Redirecting to:\n");
+    console.log(`${resetUrl}\n`);
+    console.log("Please reset your password using the web portal.\n");
+    console.log("After resetting your password, return to this terminal and log in again.\n");
+  } catch (err) {
+    console.log("\nUnable to open your browser automatically.\n");
+    console.log("Please manually visit:\n");
+    console.log(`${resetUrl}\n`);
+  }
+  await askQuestion("Press Enter to continue...");
+}
+
+async function showAuthenticationMenu() {
+  console.log("\n========================================");
+  console.log("       TallyScrapper Authentication");
+  console.log("========================================");
+  console.log("");
+  console.log("1. Login");
+  console.log("2. Forgot Password");
+  console.log("3. Exit");
+  console.log("");
+  const choice = (await askQuestion("Select an option: ")).trim();
+  return choice;
+}
+
+async function agentLogin() {
+  try {
+    const username = await askQuestion("Enter admin email: ");
+    const password = await askQuestion("Enter admin password: ", true);
+
+    const res = await axios.post(
+      `${BACKEND_URL}/auth/login`,
+      { username, password, loginType: "ADMIN" }
+    );
+
+    AUTH_TOKEN = res.data.token;
+    ADMIN_EMAIL = username;
+    console.log("✅ Agent authenticated as:", username);
+    return true;
+  } catch (err) {
+    console.error("❌ Agent login failed:", err.response?.data || err.message);
+    return false;
+  }
+}
+
+async function startAuthenticationFlow() {
+  let authenticated = false;
+
+  while (!authenticated) {
+    const choice = await showAuthenticationMenu();
+
+    if (choice === "1") {
+      const loginSuccess = await agentLogin();
+      if (loginSuccess) {
+        authenticated = true;
+      }
+    } else if (choice === "2") {
+      await handleForgotPassword();
+    } else if (choice === "3") {
+      console.log("\n👋 Exiting TallyScrapper. Goodbye!");
+      process.exit(0);
+    } else {
+      console.log("\n⚠️ Invalid option. Please select 1, 2, or 3.");
+    }
+  }
+}
+
+
+
+function loadState() {
+  if (!fs.existsSync(STATE_FILE)) {
+    return { last_voucher_alterid: 0 };
+  }
+  return JSON.parse(fs.readFileSync(STATE_FILE));
+}
+
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+//import "dotenv/config";
+
+// BACKEND URL
+const BACKEND_URL =
+  process.env.BACKEND_URL || "http://localhost:4000";
+ //process.env.BACKEND_URL || "https://tally-connect-rw12.onrender.com";
+  
+// Tally URL
+const TALLY_URL = "http://localhost:9000";
+
+// 5 second timer
+//const SYNC_INTERVAL = 5000;
+// 5 minute timer
+let SYNC_INTERVAL = 5 * 60 * 1000; // 5 minutes in ms
+
+
+function generatePayloadHash(payload) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(payload))
+    .digest("hex");
+}
+
+
+// MAIN SYNC FUNCTION
+
+
+/* --------------------------
+   1. SYNC COMPANIES
+--------------------------- */
+async function syncCompanies() {
+  const xmlRequest = `
+<ENVELOPE>
+ <HEADER>
+  <VERSION>1</VERSION>
+  <TALLYREQUEST>Export Data</TALLYREQUEST>
+  <TYPE>Collection</TYPE>
+  <ID>Company Collection</ID>
+ </HEADER>
+ <BODY>
+  <DESC>
+   <STATICVARIABLES>
+    <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+   </STATICVARIABLES>
+   <TDL>
+    <TDLMESSAGE>
+     <COLLECTION NAME="Company Collection">
+      <TYPE>Company</TYPE>
+      <FETCH>NAME,GUID</FETCH>
+     </COLLECTION>
+    </TDLMESSAGE>
+   </TDL>
+  </DESC>
+ </BODY>
+</ENVELOPE>
+`;
+
+  const response = await axios.post(TALLY_URL, xmlRequest, {
+    headers: { "Content-Type": "text/xml" },
+  });
+
+  const jsonData = await parseStringPromise(response.data);
+
+  const companies =
+    jsonData?.ENVELOPE?.BODY?.[0]?.DATA?.[0]?.COLLECTION?.[0]?.COMPANY || [];
+
+  const companyList = [];
+
+  for (let c of companies) {
+    const company_guid =
+      typeof c.GUID?.[0] === "string" ? c.GUID[0] : c.GUID?.[0]?._;
+
+    const name =
+      typeof c.NAME?.[0] === "string" ? c.NAME[0] : c.NAME?.[0]?._;
+
+    const res = await axios.post(
+      `${BACKEND_URL}/company/create`,
+      { company_guid, name },
+      authHeaders()
+    );
+
+    companyList.push({
+      company_guid,
+      name,
+    });
+  }
+
+  console.log(
+    "🏢 Companies detected from Tally:",
+    companyList.map(c => c.name).join(", ")
+  );
+
+  return companyList;
+}
+
+
+/* --------------------------
+   2. SYNC LEDGERS
+--------------------------- */
+async function syncLedgers(company) {
+
+  const xmlRequest = `
+<ENVELOPE>
+ <HEADER>
+  <VERSION>1</VERSION>
+  <TALLYREQUEST>Export Data</TALLYREQUEST>
+  <TYPE>Collection</TYPE>
+  <ID>Ledger Collection</ID>
+ </HEADER>
+ <BODY>
+  <DESC>
+<STATICVARIABLES>
+  <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+  <SVCURRENTCOMPANY>${company.name}</SVCURRENTCOMPANY>
+</STATICVARIABLES>
+
+   <TDL>
+    <TDLMESSAGE>
+     <COLLECTION NAME="Ledger Collection">
+      <TYPE>Ledger</TYPE>
+<FETCH>
+  NAME,
+  GUID,
+  PARENT,
+  ADDRESS,
+  ADDRESS.LIST,
+  MAILINGDETAILS.LIST,
+  OPENINGBALANCE,
+  CLOSINGBALANCE,
+  ISBILLWISEON,
+  LEDGERPHONE,
+  EMAIL,
+  INCOMETAXNUMBER
+</FETCH>
+
+
+
+
+     </COLLECTION>
+    </TDLMESSAGE>
+   </TDL>
+  </DESC>
+ </BODY>
+</ENVELOPE>
+`;
+
+  const res = await axios.post(TALLY_URL, xmlRequest, {
+    headers: { "Content-Type": "text/xml" },
+  });
+
+  const parser = new xml2js.Parser({ explicitArray: false });
+  const parsed = await parser.parseStringPromise(res.data);
+
+  const ledgers = parsed?.ENVELOPE?.BODY?.DATA?.COLLECTION?.LEDGER || [];
+  const ledgerArray = Array.isArray(ledgers) ? ledgers : [ledgers];
+// 🔥 Collect ALL possible text sources
+
+  console.log("Ledgers from Tally:", ledgerArray.length);
+const ledgerGuids = [];
+const requestBatch = [];
+  
+for (const l of ledgerArray) {
+  // 📮 Mailing details address (most users type contact info here)
+// 📮 Mailing details address (robust for object OR array)
+let mailingAddressText = null;
+
+const mailingRaw = l["MAILINGDETAILS.LIST"];
+const mailingArr = Array.isArray(mailingRaw)
+  ? mailingRaw
+  : mailingRaw
+  ? [mailingRaw]
+  : [];
+
+for (const m of mailingArr) {
+  if (m?.["ADDRESS.LIST"]?.ADDRESS) {
+    mailingAddressText = extractAddressValue(
+      m["ADDRESS.LIST"].ADDRESS
+    );
+    break;
+  }
+
+
+
+
+
+
+}
+
+
+
+  const ledgerName =
+    l.$?.NAME ||
+    l.NAME ||
+    (typeof l.PARENT === "string" ? l.PARENT : null);
+
+  if (!ledgerName) {
+    console.log("⚠️ Skipping ledger without name");
+    continue;
+  }
+
+  // Raw values from Tally
+  const rawPhone = l.LEDGERPHONE?._ || l.LEDGERPHONE || null;
+  const rawEmail = l.EMAIL?._ || l.EMAIL || null;
+
+  // Addresses (both formats)
+  const addressText = normalizeText(l.ADDRESS);
+let addressListText = null;
+if (l["ADDRESS.LIST"]?.ADDRESS) {
+  addressListText = extractAddressValue(l["ADDRESS.LIST"].ADDRESS);
+}
+
+
+
+
+  // 🔎 ONE unified searchable blob
+  const searchBlob = [
+    rawPhone,
+    rawEmail,
+    addressText,
+    addressListText,
+      mailingAddressText, 
+    l.NAME,
+    l.PARENT
+  ].filter(Boolean).join(" ");
+
+  // 🔥 Smart extraction
+  const phone = extractPhone(searchBlob);
+  const email = extractEmail(searchBlob);
+
+  const pan =
+    typeof l.INCOMETAXNUMBER === "string"
+      ? l.INCOMETAXNUMBER
+      : l.INCOMETAXNUMBER?._ || null;
+
+const ledgerGuid =
+  typeof l.GUID === "string"
+    ? l.GUID
+    : l.GUID?._ || null;
+
+// 🚨 SKIP SYSTEM / BROKEN LEDGERS
+if (!ledgerGuid || !ledgerName) {
+  console.log("⏭️ Skipping invalid ledger:", ledgerName);
+  continue;
+}
+
+ledgerGuids.push(ledgerGuid);
+
+requestBatch.push(
+  axios.post(
+    `${BACKEND_URL}/ledger/sync`,
+    {
+      ledger_guid: ledgerGuid,
+      company_guid: company.company_guid,
+      name: ledgerName,
+      parent_group:
+        typeof l.PARENT === "string" ? l.PARENT : l.PARENT?._,
+      opening_balance: parseTallyNumber(l.OPENINGBALANCE?._ || "0"),
+      closing_balance: parseTallyNumber(l.CLOSINGBALANCE?._ || "0"),
+      type: l.ISBILLWISEON === "Yes" ? "Party" : "General",
+      phone,
+      email,
+      pan
+    },
+    authHeaders()
+  )
+);
+if (requestBatch.length >= 10) {
+  await Promise.all(requestBatch);
+  requestBatch.length = 0;
+
+    // small delay to protect backend
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+}
+
+  if (ledgerGuids.length % 100 === 0) {
+  console.log("Ledgers processed:", ledgerGuids.length);
+}
+}
+if (requestBatch.length > 0) {
+  await Promise.all(requestBatch);
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+}
+
+// 🔥 Cleanup missing ledgers in backend
+if (ledgerGuids.length > 0) {
+  await axios.post(
+  `${BACKEND_URL}/ledger/cleanup/ledger`,
+    {
+      company_guid: company.company_guid,
+      existing_ids: ledgerGuids
+    },
+    authHeaders()
+  );
+
+  console.log("🧹 Ledger cleanup completed");
+}
+
+
+}
+
+
+
+
+
+
+const BATCH_SIZE = 500;
+
+
+/* =====================================================
+   PROCESS VOUCHER COMMANDS (CREATE / ALTER)
+===================================================== */
+async function processLedgerCommands() {
+
+const res = await axios.get(
+`${BACKEND_URL}/sync-queue/pending-ledgers?company_guid=${ACTIVE_COMPANY_GUID}`,
+authHeaders()
+);
+
+const commands = res.data || [];
+
+for (const cmd of commands) {
+
+try {
+
+await axios.post(
+`${BACKEND_URL}/sync-queue/${cmd.id}/processing`,
+{},
+authHeaders()
+);
+
+const payload =
+typeof cmd.payload === "string"
+? JSON.parse(cmd.payload)
+: cmd.payload;
+
+const xml = buildLedgerXML(cmd.action, payload, ACTIVE_COMPANY_NAME);
+
+const tallyRes = await axios.post(TALLY_URL, xml, {
+ headers: { "Content-Type": "text/xml" }
+});
+
+if (tallyRes.data.includes("<LINEERROR>")) {
+ throw new Error("Ledger creation failed");
+}
+
+await axios.post(
+`${BACKEND_URL}/sync-queue/${cmd.id}/success`,
+{},
+authHeaders()
+);
+
+} catch (err) {
+
+await axios.post(
+`${BACKEND_URL}/sync-queue/${cmd.id}/failed`,
+{ error: err.message },
+authHeaders()
+);
+
+console.error("Ledger command failed:", err.message);
+
+}
+
+}
+
+/* =====================================================
+   BUILD TALLY ledger to software tally XML
+===================================================== */
+
+function buildLedgerXML(action, payload, companyName){
+
+return `
+<ENVELOPE>
+ <HEADER>
+  <TALLYREQUEST>Import Data</TALLYREQUEST>
+ </HEADER>
+
+ <BODY>
+  <IMPORTDATA>
+   <REQUESTDESC>
+    <REPORTNAME>All Masters</REPORTNAME>
+
+    <STATICVARIABLES>
+      <SVCOMPANY>${escapeXML(companyName)}</SVCOMPANY>
+    </STATICVARIABLES>
+
+   </REQUESTDESC>
+
+   <REQUESTDATA>
+
+    <TALLYMESSAGE>
+
+      <LEDGER NAME="${escapeXML(payload.name)}" ACTION="${action}">
+        <NAME>${escapeXML(payload.name)}</NAME>
+        <PARENT>${escapeXML(payload.parent_group || "")}</PARENT>
+        <EMAIL>${escapeXML(payload.email || "")}</EMAIL>
+        <PHONENUMBER>${escapeXML(payload.phone || "")}</PHONENUMBER>
+        <OPENINGBALANCE>${payload.opening_balance || 0}</OPENINGBALANCE>
+      </LEDGER>
+
+    </TALLYMESSAGE>
+
+   </REQUESTDATA>
+
+  </IMPORTDATA>
+ </BODY>
+</ENVELOPE>
+`;
+}
+}
+/* --------------------------
+   3. SYNC VOUCHERS
+--------------------------- */
+
+
+async function syncVouchers() {
+
+
+
+  const invoiceItemBatch = [];
+  const invoiceBatch = [];
+
+  if (!ACTIVE_COMPANY_GUID) {
+    console.log("⚠️ No active company. Skipping vouchers.");
+    return;
+  }
+// 🔥 Step 1: Reset all vouchers to inactive
+await axios.post(
+  `${BACKEND_URL}/voucher-entry/reset-active`,
+  { company_guid: ACTIVE_COMPANY_GUID },
+  authHeaders()
+);
+  const voucherMap = new Map();
+const voucherGuids = [];
+
+  // 🔥 Helper to normalize Tally XML values
+  function extractValue(val) {
+    if (!val) return null;
+    if (typeof val === "string") return val;
+    if (typeof val === "object" && val._) return val._;
+    return null;
+  }
+
+  // 🔥 UNIVERSAL VOUCHER COLLECTION (NO DATE RESTRICTION)
+  const xmlRequest = `
+<ENVELOPE>
+ <HEADER>
+  <VERSION>1</VERSION>
+  <TALLYREQUEST>Export Data</TALLYREQUEST>
+  <TYPE>Collection</TYPE>
+  <ID>VoucherCollection</ID>
+ </HEADER>
+ <BODY>
+  <DESC>
+   <STATICVARIABLES>
+    <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+    <SVCURRENTCOMPANY>${ACTIVE_COMPANY_NAME}</SVCURRENTCOMPANY>
+   </STATICVARIABLES>
+   <TDL>
+    <TDLMESSAGE>
+     <COLLECTION NAME="VoucherCollection">
+      <TYPE>Voucher</TYPE>
+      <FETCH>
+        GUID,
+        DATE,
+        VOUCHERTYPENAME,
+        VOUCHERNUMBER,
+        REFERENCE,
+        PARTYLEDGERNAME,
+        ALLLEDGERENTRIES.LIST,
+        LEDGERENTRIES.LIST
+      </FETCH>
+     </COLLECTION>
+    </TDLMESSAGE>
+   </TDL>
+  </DESC>
+ </BODY>
+</ENVELOPE>
+`;
+
+  const res = await axios.post(TALLY_URL, xmlRequest, {
+    headers: { "Content-Type": "text/xml" },
+  });
+
+  const parsed = await parseStringPromise(res.data);
+
+  const vouchers =
+    parsed?.ENVELOPE?.BODY?.[0]
+      ?.DATA?.[0]
+      ?.COLLECTION?.[0]
+      ?.VOUCHER || [];
+
+  const msgArray = Array.isArray(vouchers) ? vouchers : [vouchers];
+
+  for (const v of msgArray) {
+
+    const voucherGuid = extractValue(v.GUID?.[0]);
+    if (!voucherGuid) continue;
+voucherGuids.push(voucherGuid);
+
+    // 🔥 Fix Date
+    const rawDate = extractValue(
+      v.DATE?.[0] || v.REFERENCEDATE?.[0]
+    );
+
+    const voucherDate = rawDate
+      ? `${rawDate.slice(0,4)}-${rawDate.slice(4,6)}-${rawDate.slice(6,8)}`
+      : null;
+
+    // 🔥 Fix Voucher Type
+    const voucherType = extractValue(
+      v.VOUCHERTYPENAME?.[0] || v.VOUCHERTYPE?.[0]
+    );
+
+    // 🔥 Fix Reference Number
+    const referenceNo = extractValue(
+      v.REFERENCE?.[0] ||
+      v.REFERENCENUMBER?.[0] ||
+      v.VOUCHERNUMBER?.[0]
+    );
+
+    if (!voucherMap.has(voucherGuid)) {
+      voucherMap.set(voucherGuid, {
+        voucher_guid: voucherGuid,
+        company_guid: ACTIVE_COMPANY_GUID,
+        voucher_date: voucherDate,
+        voucher_type: voucherType,
+        reference_no: referenceNo,
+        net_amount: 0,
+        entries: []
+      });
+    }
+
+    const rawLedgerEntries = [
+      ...(Array.isArray(v["ALLLEDGERENTRIES.LIST"])
+        ? v["ALLLEDGERENTRIES.LIST"]
+        : v["ALLLEDGERENTRIES.LIST"]
+        ? [v["ALLLEDGERENTRIES.LIST"]]
+        : []),
+
+      ...(Array.isArray(v["LEDGERENTRIES.LIST"])
+        ? v["LEDGERENTRIES.LIST"]
+        : v["LEDGERENTRIES.LIST"]
+        ? [v["LEDGERENTRIES.LIST"]]
+        : [])
+    ];
+
+    const entryArray =
+      Array.isArray(rawLedgerEntries)
+        ? rawLedgerEntries.filter(e => typeof e === "object")
+        : typeof rawLedgerEntries === "object"
+        ? [rawLedgerEntries]
+        : [];
+
+    for (const e of entryArray) {
+      const ledgerName = extractValue(e.LEDGERNAME?.[0]);
+      const amountRaw = extractValue(e.AMOUNT?.[0]);
+      if (!ledgerName || !amountRaw) continue;
+
+      const isDebit = extractValue(e.ISDEEMEDPOSITIVE?.[0]) === "No";
+
+      voucherMap.get(voucherGuid).entries.push({
+        ledger_name: ledgerName,
+        amount: Math.abs(Number(amountRaw)),
+        is_debit: isDebit
+      });
+    }
+
+    if (
+      voucherMap.get(voucherGuid).entries.length === 0 &&
+      v.PARTYLEDGERNAME?.[0]
+    ) {
+      voucherMap.get(voucherGuid).entries.push({
+        ledger_name: extractValue(v.PARTYLEDGERNAME?.[0]),
+        amount: 0,
+        is_debit: false
+      });
+    }
+
+    let debitTotal = 0;
+    let creditTotal = 0;
+
+    for (const entry of voucherMap.get(voucherGuid).entries) {
+      if (entry.is_debit) debitTotal += entry.amount;
+      else creditTotal += entry.amount;
+    }
+
+    const netAmount = Math.max(debitTotal, creditTotal);
+    voucherMap.get(voucherGuid).net_amount = netAmount;
+
+    const isPurchase =
+      voucherType &&
+      voucherType.toLowerCase().includes("purchase");
+
+    const isSales =
+      voucherType &&
+      (voucherType.toLowerCase().includes("sales") ||
+       voucherType.toLowerCase().includes("invoice"));
+
+    if (isPurchase || isSales) {
+      await axios.post(
+        `${BACKEND_URL}/invoice/sync`,
+        {
+          invoice_guid: voucherGuid,
+          company_guid: ACTIVE_COMPANY_GUID,
+          invoice_no: extractValue(v.VOUCHERNUMBER?.[0]),
+          invoice_date: voucherDate,
+          invoice_type: isPurchase ? "Purchase" : "Sales",
+          party_name: extractValue(v.PARTYLEDGERNAME?.[0]),
+          total_amount: netAmount,
+        },
+        authHeaders()
+      );
+    }
+  }
+
+  const requestBatch = [];
+
+for (const voucher of voucherMap.values()) {
+
+  requestBatch.push(
+    axios.post(
+      `${BACKEND_URL}/voucher-entry/sync`,
+      voucher,
+      authHeaders()
+    )
+  );
+
+  if (requestBatch.length >= 50) {
+    await Promise.all(requestBatch);
+    requestBatch.length = 0;
+  }
+}
+
+if (requestBatch.length > 0) {
+  await Promise.all(requestBatch);
+}
+
+console.log("📦 Vouchers processed:", voucherMap.size);
+
+  
+/* -----------------------------
+   CLEANUP MISSING VOUCHERS
+----------------------------- */
+
+if (voucherGuids.length > 0) {
+
+  await axios.post(
+    `${BACKEND_URL}/voucher-entry/cleanup/voucher`,
+    {
+      company_guid: ACTIVE_COMPANY_GUID,
+      existing_ids: voucherGuids
+    },
+    authHeaders()
+  );
+
+  console.log("🧹 Voucher cleanup completed");
+
+}
+}
+/* =====================================================
+   PROCESS VOUCHER COMMANDS (CREATE / ALTER)
+===================================================== */
+async function processVoucherCommands() {
+  if (!ACTIVE_COMPANY_GUID) return;
+
+  let commands;
+
+  try {
+    const res = await axios.get(
+      `${BACKEND_URL}/sync-queue/pending?voucher=true&company_guid=${ACTIVE_COMPANY_GUID}`,
+     // `${BACKEND_URL}/sync-queue/pending?company_guid=${ACTIVE_COMPANY_GUID}`,
+      authHeaders()
+    );
+
+    commands = res.data || [];
+  } catch (err) {
+    console.error("❌ Failed to fetch voucher commands:", err.message);
+    return;
+  }
+
+  for (const cmd of commands) {
+    const { id, action, payload } = cmd;
+
+    try {
+      // 🔒 Mark processing
+      await axios.post(
+        `${BACKEND_URL}/sync-queue/${id}/processing`,
+        {},
+        authHeaders()
+      );
+
+const xml = buildVoucherXML(action, payload, ACTIVE_COMPANY_NAME);
+if (DEBUG) console.log("📤 SENDING XML TO TALLY:\n", xml);
+if (DEBUG) console.log("📤 Voucher Payload:\n", JSON.stringify(payload, null, 2));
+if (DEBUG) console.log("📤 Voucher Company:", ACTIVE_COMPANY_NAME);
+if (DEBUG) console.log("📤 Voucher XML:\n", xml);
+
+      const tallyRes = await axios.post(TALLY_URL, xml, {
+        headers: { "Content-Type": "text/xml" },
+      });
+if (DEBUG) {
+  console.log("📥 RAW TALLY RESPONSE START ==================");
+  console.log(tallyRes.data);
+  console.log("📥 RAW TALLY RESPONSE END ====================");
+}
+     if (tallyRes.data.includes("<LINEERROR>")) {
+  console.error("❌ TALLY RAW RESPONSE:\n", tallyRes.data);
+
+  const errorMatch = tallyRes.data.match(/<LINEERROR>(.*?)<\/LINEERROR>/s);
+  const tallyError = errorMatch ? errorMatch[1] : "Unknown Tally error";
+
+  throw new Error(`Tally Error: ${tallyError}`);
+}
+
+
+
+      // ✅ Mark success
+      await axios.post(
+        `${BACKEND_URL}/sync-queue/${id}/success`,
+        {},
+        authHeaders()
+      );
+
+      console.log(`✅ Voucher ${action} executed (queue_id=${id})`);
+    } catch (err) {
+      console.error(`❌ Voucher ${action} failed (queue_id=${id}):`, err.message);
+
+      await axios.post(
+        `${BACKEND_URL}/sync-queue/${id}/failed`,
+        { error: err.message },
+        authHeaders()
+      );
+    }
+  }
+}
+
+
+
+/* =====================================================
+   BUILD TALLY VOUCHER to software tally  XML
+===================================================== */
+
+function buildVoucherXML(action, payload, companyName) {
+
+  if (action === "DELETE") {
+  return `
+<ENVELOPE>
+ <HEADER>
+  <TALLYREQUEST>Import Data</TALLYREQUEST>
+ </HEADER>
+ <BODY>
+  <IMPORTDATA>
+   <REQUESTDESC>
+    <REPORTNAME>Vouchers</REPORTNAME>
+    <STATICVARIABLES>
+      <SVCOMPANY>${companyName}</SVCOMPANY>
+    </STATICVARIABLES>
+   </REQUESTDESC>
+   <REQUESTDATA>
+    <TALLYMESSAGE>
+     <VOUCHER ACTION="Cancel">
+      <GUID>${payload.voucher_guid}</GUID>
+      <CANCELLED>Yes</CANCELLED>
+     </VOUCHER>
+    </TALLYMESSAGE>
+   </REQUESTDATA>
+  </IMPORTDATA>
+ </BODY>
+</ENVELOPE>
+`;
+}
+
+
+  function toTallyDate(d) {
+  if (!d) return "";
+  return d.split("T")[0].replace(/-/g, ""); // YYYYMMDD
+}
+
+
+  const {
+    voucher_guid,
+    voucher_type,
+    voucher_date,
+    narration,
+    ledger_entries
+  } = payload;
+
+  const allowedVoucherTypes = [
+    "Journal",
+    "Payment",
+    "Receipt",
+    "Sales",
+    "Purchase"
+  ];
+
+  if (!allowedVoucherTypes.includes(voucher_type)) {
+    throw new Error(`Unsupported voucher type: ${voucher_type}`);
+  }
+
+  if (!voucher_date) {
+    throw new Error("Voucher date missing");
+  }
+
+  if (!Array.isArray(ledger_entries) || ledger_entries.length < 2) {
+    throw new Error("Minimum 2 ledger entries required");
+  }
+
+  if (
+    (voucher_type === "Sales" || voucher_type === "Purchase") &&
+    !ledger_entries.some(e => e.ledger_name && e.ledger_name.trim())
+  ) {
+    throw new Error("Sales / Purchase voucher requires Party ledger");
+  }
+
+const date = toTallyDate(voucher_date);
+
+
+ const entryTag = "ALLLEDGERENTRIES.LIST";
+
+
+const ledgerXML = ledger_entries
+  .map((e) => {
+    const isDeemedPositive = e.is_debit ? "No" : "Yes";
+    const amount = e.is_debit
+      ? Math.abs(e.amount)
+      : -Math.abs(e.amount);
+
+    return `
+      <${entryTag}>
+        <LEDGERNAME>${e.ledger_name.trim()}</LEDGERNAME>
+        <ISDEEMEDPOSITIVE>${isDeemedPositive}</ISDEEMEDPOSITIVE>
+        <AMOUNT>${amount}</AMOUNT>
+      </${entryTag}>
+    `;
+  })
+  .join("");
+
+
+  return `
+<ENVELOPE>
+ <HEADER>
+  <TALLYREQUEST>Import Data</TALLYREQUEST>
+ </HEADER>
+
+ <BODY>
+  <IMPORTDATA>
+   <REQUESTDESC>
+    <REPORTNAME>Vouchers</REPORTNAME>
+    <STATICVARIABLES>
+      <SVCOMPANY>${companyName}</SVCOMPANY>
+    </STATICVARIABLES>
+   </REQUESTDESC>
+
+   <REQUESTDATA>
+    <TALLYMESSAGE>
+     <VOUCHER ACTION="${action === "ALTER" ? "Alter" : "Create"}"
+              VCHTYPE="${voucher_type}">
+      <DATE>${date}</DATE>
+      <EFFECTIVEDATE>${date}</EFFECTIVEDATE>
+      <VOUCHERTYPENAME>${voucher_type}</VOUCHERTYPENAME>
+      <PERSISTEDVIEW>Accounting Voucher View</PERSISTEDVIEW>
+      <ISINVOICE>No</ISINVOICE>
+${voucher_guid ? `<GUID>${voucher_guid}</GUID>` : ""}
+
+      ${narration ? `<NARRATION>${narration}</NARRATION>` : ""}
+      ${ledgerXML}
+     </VOUCHER>
+    </TALLYMESSAGE>
+   </REQUESTDATA>
+  </IMPORTDATA>
+ </BODY>
+</ENVELOPE>
+`;
+}
+
+
+
+/* =====================================================
+   BUILD TALLY VOUCHER to software tally  XML
+===================================================== */
+function generateTallyBillXML(payload, companyName) {
+  
+  const { ledger_name, bill_name, bill_date, amount } = payload;
+
+  const date = bill_date.replace(/-/g, "");
+
+  return `
+<ENVELOPE>
+ <HEADER>
+  <VERSION>1</VERSION>
+  <TALLYREQUEST>Import</TALLYREQUEST>
+  <TYPE>Data</TYPE>
+  <ID>Vouchers</ID>
+ </HEADER>
+
+ <BODY>
+  <DATA>
+   <TALLYMESSAGE>
+    <VOUCHER>
+      <DATE>${date}</DATE>
+      <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+      <VOUCHERNUMBER>${bill_name}</VOUCHERNUMBER>
+
+      <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
+      <OBJVIEW>Invoice Voucher View</OBJVIEW>
+      <ISINVOICE>Yes</ISINVOICE>
+
+      <!-- PARTY LEDGER -->
+      <LEDGERENTRIES.LIST>
+        <LEDGERNAME>${ledger_name}</LEDGERNAME>
+        <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+        <ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+        <AMOUNT>-${amount}</AMOUNT>
+
+        <BILLALLOCATIONS.LIST>
+          <NAME>${bill_name}</NAME>
+          <BILLTYPE>New Ref</BILLTYPE>
+          <AMOUNT>-${amount}</AMOUNT>
+        </BILLALLOCATIONS.LIST>
+      </LEDGERENTRIES.LIST>
+
+      <!-- SALES LEDGER -->
+      <ALLINVENTORYENTRIES.LIST>
+        <STOCKITEMNAME>Invoice Value</STOCKITEMNAME>
+        <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+        <AMOUNT>${amount}</AMOUNT>
+
+        <ACCOUNTINGALLOCATIONS.LIST>
+          <LEDGERNAME>Sales</LEDGERNAME>
+          <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+          <AMOUNT>${amount}</AMOUNT>
+        </ACCOUNTINGALLOCATIONS.LIST>
+      </ALLINVENTORYENTRIES.LIST>
+
+    </VOUCHER>
+   </TALLYMESSAGE>
+  </DATA>
+ </BODY>
+</ENVELOPE>
+`;
+}
+
+
+
+
+
+async function testCreateVoucher(companyName) {
+  const xml = `
+<ENVELOPE>
+ <HEADER>
+  <TALLYREQUEST>Import Data</TALLYREQUEST>
+ </HEADER>
+ <BODY>
+  <IMPORTDATA>
+   <REQUESTDESC>
+    <REPORTNAME>Vouchers</REPORTNAME>
+    <STATICVARIABLES>
+      <SVCOMPANY>${companyName}</SVCOMPANY>
+    </STATICVARIABLES>
+   </REQUESTDESC>
+   <REQUESTDATA>
+    <TALLYMESSAGE>
+     <VOUCHER>
+      <DATE>20260127</DATE>
+      <EFFECTIVEDATE>20260127</EFFECTIVEDATE>
+      <VOUCHERTYPENAME>Journal</VOUCHERTYPENAME>
+      <PERSISTEDVIEW>Accounting Voucher View</PERSISTEDVIEW>
+
+      <ALLLEDGERENTRIES.LIST>
+        <LEDGERNAME>Cash</LEDGERNAME>
+        <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+        <AMOUNT>-100</AMOUNT>
+      </ALLLEDGERENTRIES.LIST>
+
+      <ALLLEDGERENTRIES.LIST>
+        <LEDGERNAME>Capital</LEDGERNAME>
+        <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+        <AMOUNT>100</AMOUNT>
+      </ALLLEDGERENTRIES.LIST>
+
+     </VOUCHER>
+    </TALLYMESSAGE>
+   </REQUESTDATA>
+  </IMPORTDATA>
+ </BODY>
+</ENVELOPE>
+`;
+
+  const res = await axios.post(TALLY_URL, xml, {
+    headers: { "Content-Type": "text/xml" },
+  });
+
+  console.log("WRITE TEST RESPONSE:\n", res.data);
+}
+
+
+
+
+/* --------------------------
+   4. SYNC BILLS payable
+--------------------------- */
+
+/* --------------------------
+   SYNC BILLS PAYABLE
+--------------------------- */
+async function syncBillsPayable() {
+
+
+
+  if (!ACTIVE_COMPANY_GUID) {
+    console.log("⚠️ No active company. Skipping bills payable sync.");
+    return;
+  }
+
+  console.log("🧾 Syncing Bills Payable (Suppliers)...");
+
+  const xmlRequest = `
+<ENVELOPE>
+ <HEADER>
+  <TALLYREQUEST>Export Data</TALLYREQUEST>
+ </HEADER>
+ <BODY>
+  <EXPORTDATA>
+   <REQUESTDESC>
+    <REPORTNAME>Bills Payable</REPORTNAME>
+    <STATICVARIABLES>
+     <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+     <SVCURRENTCOMPANY>${ACTIVE_COMPANY_NAME}</SVCURRENTCOMPANY>
+     <SVFROMDATE>19000101</SVFROMDATE>
+<SVTODATE>20991231</SVTODATE>
+    </STATICVARIABLES>
+   </REQUESTDESC>
+  </EXPORTDATA>
+ </BODY>
+</ENVELOPE>
+`;
+
+  const res = await axios.post(TALLY_URL, xmlRequest, {
+    headers: { "Content-Type": "text/xml" },
+  });
+
+  const parsed = await parseStringPromise(res.data);
+
+  const envelope = parsed?.ENVELOPE || {};
+
+  const billFixedArr = Array.isArray(envelope.BILLFIXED)
+    ? envelope.BILLFIXED
+    : envelope.BILLFIXED
+    ? [envelope.BILLFIXED]
+    : [];
+
+  const billAmounts = Array.isArray(envelope.BILLCL)
+    ? envelope.BILLCL
+    : envelope.BILLCL
+    ? [envelope.BILLCL]
+    : [];
+
+  const billDueArr = Array.isArray(envelope.BILLDUE)
+    ? envelope.BILLDUE
+    : envelope.BILLDUE
+    ? [envelope.BILLDUE]
+    : [];
+
+
+
+  let synced = 0;
+
+for (let i = 0; i < billFixedArr.length; i++) {
+
+  const bill = billFixedArr[i];
+
+  const ledgerName = normalizeText(bill.BILLPARTY);
+  const billName   = normalizeText(bill.BILLREF);
+  const billDate   = normalizeText(bill.BILLDATE);
+
+  if (!ledgerName || !billName) {
+    console.log("⏭️ Skipping invalid payable bill:", bill);
+    continue;
+  }
+
+  const pendingAmt = Math.abs(
+    parseTallyNumber(billAmounts[i] || "0")
+  );
+
+  const dueDate = normalizeText(billDueArr[i] || null);
+
+  const payload = {
+    company_guid: ACTIVE_COMPANY_GUID,
+    ledger_name: ledgerName,
+    bill_name: billName,
+    bill_date: billDate,
+    bill_amount: pendingAmt,
+    pending_amount: pendingAmt,
+    due_date: dueDate,
+    bill_type: "PAYABLE"
+  };
+
+  await axios.post(
+    `${BACKEND_URL}/bill/sync`,
+    payload,
+    authHeaders()
+  );
+
+  synced++;
+}
+
+console.log(`✅ Bills Payable synced: ${synced}`);
+}
+
+
+/* --------------------------
+   4. SYNC BILLS
+--------------------------- */
+async function syncBills() {
+
+
+
+
+
+
+  if (!ACTIVE_COMPANY_GUID) {
+    console.log("⚠️ No active company. Skipping bills sync.");
+    return;
+  }
+
+  console.log("🧾 Syncing Bills Receivable (Full Report)...");
+
+  const xmlRequest = `
+<ENVELOPE>
+ <HEADER>
+  <TALLYREQUEST>Export Data</TALLYREQUEST>
+ </HEADER>
+ <BODY>
+  <EXPORTDATA>
+   <REQUESTDESC>
+    <REPORTNAME>Bills Receivable</REPORTNAME>
+    <STATICVARIABLES>
+     <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+     <SVCURRENTCOMPANY>${ACTIVE_COMPANY_NAME}</SVCURRENTCOMPANY>
+     <SVCOMPANY>${ACTIVE_COMPANY_NAME}</SVCOMPANY>
+     <SVFROMDATE>19000101</SVFROMDATE>
+<SVTODATE>20991231</SVTODATE>
+    </STATICVARIABLES>
+   </REQUESTDESC>
+  </EXPORTDATA>
+ </BODY>
+</ENVELOPE>
+`;
+
+  const res = await axios.post(TALLY_URL, xmlRequest, {
+    headers: { "Content-Type": "text/xml" },
+  });
+
+  const parsed = await parseStringPromise(res.data);
+
+
+
+
+
+  console.log("🧾 RAW BILLS XML OBJECT:");
+console.log(JSON.stringify(parsed, null, 2));
+
+ const envelope = parsed?.ENVELOPE || {};
+
+const billFixedArr = Array.isArray(envelope.BILLFIXED)
+  ? envelope.BILLFIXED
+  : envelope.BILLFIXED
+  ? [envelope.BILLFIXED]
+  : [];
+
+const billAmounts = Array.isArray(envelope.BILLCL)
+  ? envelope.BILLCL
+  : envelope.BILLCL
+  ? [envelope.BILLCL]
+  : [];
+
+const billDueArr = Array.isArray(envelope.BILLDUE)
+  ? envelope.BILLDUE
+  : envelope.BILLDUE
+  ? [envelope.BILLDUE]
+  : [];
+
+const billOverArr = Array.isArray(envelope.BILLOVERDUE)
+  ? envelope.BILLOVERDUE
+  : envelope.BILLOVERDUE
+  ? [envelope.BILLOVERDUE]
+  : [];
+
+const bills = Array.isArray(billFixedArr)
+  ? billFixedArr
+  : [billFixedArr];
+
+  // 🔥 Build amount map by BILLREF
+
+let synced = 0;
+
+for (let i = 0; i < billFixedArr.length; i++) {
+
+  const bill = billFixedArr[i];
+
+  const ledgerName = normalizeText(bill.BILLPARTY);
+  const billName   = normalizeText(bill.BILLREF);
+  const billDate   = normalizeText(bill.BILLDATE);
+
+  if (!ledgerName || !billName) continue;
+
+  const pendingAmt = Math.abs(
+    parseTallyNumber(billAmounts[i] || "0")
+  );
+
+  const dueDate = normalizeText(billDueArr[i] || null);
+
+  const overdueDays = parseTallyNumber(
+    billOverArr[i] || "0"
+  );
+
+  const payload = {
+    company_guid: ACTIVE_COMPANY_GUID,
+    ledger_name: ledgerName,
+    bill_name: billName,
+    bill_date: billDate,
+    due_date: dueDate,
+    pending_amount: pendingAmt,
+    overdue_days: overdueDays
+  };
+
+  await axios.post(
+    `${BACKEND_URL}/bill/sync`,
+    payload,
+    authHeaders()
+  );
+
+  synced++;
+}
+
+console.log(`✅ Bills synced: ${synced}`);
+
+}
+
+
+
+
+
+
+
+/* --------------------------
+   5. SYNC  ORDERS
+--------------------------- */
+
+async function syncOrders() {
+  if (!ACTIVE_COMPANY_GUID) return;
+
+  const xml = `
+<ENVELOPE>
+ <HEADER>
+  <VERSION>1</VERSION>
+  <TALLYREQUEST>Export Data</TALLYREQUEST>
+  <TYPE>Collection</TYPE>
+  <ID>OrderCollection</ID>
+ </HEADER>
+ <BODY>
+  <DESC>
+   <STATICVARIABLES>
+    <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+    <SVCURRENTCOMPANY>${ACTIVE_COMPANY_NAME}</SVCURRENTCOMPANY>
+   </STATICVARIABLES>
+
+   <TDL>
+    <TDLMESSAGE>
+
+     <COLLECTION NAME="OrderCollection">
+      <TYPE>Voucher</TYPE>
+
+      <!-- 🔥 FILTER BY VOUCHER TYPE NAME -->
+      <FILTER>SalesPurchaseOrderFilter</FILTER>
+
+      <FETCH>
+        GUID,
+        DATE,
+        VOUCHERNUMBER,
+        VOUCHERTYPENAME,
+        PARTYLEDGERNAME,
+        AMOUNT
+      </FETCH>
+     </COLLECTION>
+
+     <SYSTEM TYPE="Formulae" NAME="SalesPurchaseOrderFilter">
+       $VoucherTypeName = "Sales Order" OR
+       $VoucherTypeName = "Purchase Order"
+     </SYSTEM>
+
+    </TDLMESSAGE>
+   </TDL>
+  </DESC>
+ </BODY>
+</ENVELOPE>
+`;
+
+  const res = await axios.post(TALLY_URL, xml, {
+    headers: { "Content-Type": "text/xml" }
+  });
+
+  if (DEBUG) console.log("📥 RAW ORDER XML:\n", res.data);
+
+  const parsed = await parseStringPromise(res.data);
+
+  const vouchers =
+    parsed?.ENVELOPE?.BODY?.[0]
+      ?.DATA?.[0]
+      ?.COLLECTION?.[0]
+      ?.VOUCHER || [];
+
+  const voucherArray = Array.isArray(vouchers)
+    ? vouchers
+    : [vouchers];
+
+  console.log("📦 Orders Found:", voucherArray.length);
+
+  const orderGuids = [];
+
+  for (const v of voucherArray) {
+    const voucherType = v.VOUCHERTYPENAME?.[0];
+
+    
+  const orderGuid = v.GUID?.[0];
+  if (!orderGuid) continue;
+
+      orderGuids.push(orderGuid);
+
+    await axios.post(
+      `${BACKEND_URL}/orders/sync`,
+      {
+        order_guid: v.GUID?.[0],
+        company_guid: ACTIVE_COMPANY_GUID,
+        order_no: v.VOUCHERNUMBER?.[0],
+        order_date: normalizeText(v.DATE?.[0]),
+party_name: normalizeText(v.PARTYLEDGERNAME?.[0]),
+
+        total_amount: parseTallyNumber(v.AMOUNT?.[0] || "0"),
+        type:
+          voucherType === "Sales Order"
+            ? "Sales"
+            : "Purchase",
+      },
+      authHeaders()
+    );
+  }
+  // 🔥 Cleanup missing orders in backend
+if (voucherArray.length > 0 && orderGuids.length > 0) {
+  await axios.post(
+  `${BACKEND_URL}/orders/cleanup/order`,    {
+      company_guid: ACTIVE_COMPANY_GUID,
+      existing_ids: orderGuids
+    },
+    authHeaders()
+  );
+
+  console.log("🧹 Order cleanup completed");
+}
+}
+
+
+
+
+/* --------------------------
+   5. SYNC SALES ORDERS
+--------------------------- */
+
+
+//inventory data 
+
+async function fetchFullStockData() {
+
+  if (!ACTIVE_COMPANY_GUID) return;
+
+  const xml = `
+<ENVELOPE>
+ <HEADER>
+  <VERSION>1</VERSION>
+  <TALLYREQUEST>Export</TALLYREQUEST>
+  <TYPE>Collection</TYPE>
+  <ID>StockItemCollection</ID>
+ </HEADER>
+ <BODY>
+  <DESC>
+   <STATICVARIABLES>
+    <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+    <SVCURRENTCOMPANY>${ACTIVE_COMPANY_NAME}</SVCURRENTCOMPANY>
+   </STATICVARIABLES>
+   <TDL>
+    <TDLMESSAGE>
+     <COLLECTION NAME="StockItemCollection">
+      <TYPE>StockItem</TYPE>
+      <FETCH>
+        NAME,
+        GUID,
+        PARENT,
+        BASEUNITS,
+        OPENINGBALANCE,
+        OPENINGVALUE,
+        CLOSINGBALANCE,
+        CLOSINGVALUE
+      </FETCH>
+     </COLLECTION>
+    </TDLMESSAGE>
+   </TDL>
+  </DESC>
+ </BODY>
+</ENVELOPE>
+`;
+
+  const res = await axios.post(TALLY_URL, xml, {
+    headers: { "Content-Type": "text/xml" },
+  });
+
+  const parsed = await parseStringPromise(res.data);
+
+  const items =
+    parsed?.ENVELOPE?.BODY?.[0]?.DATA?.[0]?.COLLECTION?.[0]?.STOCKITEM || [];
+
+  const itemArray = Array.isArray(items) ? items : [items];
+
+  console.log("📦 Stock items from Tally:", itemArray.length);
+
+  const itemGuids = [];
+  const requestBatch = [];
+
+  for (const i of itemArray) {
+
+    const itemName =
+      normalizeText(i.NAME?.[0]) ||
+      i.$?.NAME ||
+      null;
+
+    if (!itemName) continue;
+
+    const payload = {
+      company_guid: ACTIVE_COMPANY_GUID,
+      item_guid: normalizeText(i.GUID?.[0]) || i.$?.GUID || null,
+      name: itemName,
+      group: normalizeText(i.PARENT?.[0]),
+      unit: normalizeText(i.BASEUNITS?.[0]),
+      opening_qty: parseTallyNumber(i.OPENINGBALANCE?.[0]),
+      opening_value: parseTallyNumber(i.OPENINGVALUE?.[0]),
+      closing_qty: parseTallyNumber(i.CLOSINGBALANCE?.[0]),
+      closing_value: parseTallyNumber(i.CLOSINGVALUE?.[0]),
+    };
+
+    if (!payload.item_guid) continue;
+
+    itemGuids.push(payload.item_guid);
+
+    requestBatch.push(
+      axios.post(
+        `${BACKEND_URL}/inventory/full-sync`,
+        payload,
+        authHeaders()
+      )
+    );
+
+    if (requestBatch.length >= 50) {
+      await Promise.all(requestBatch);
+      requestBatch.length = 0;
+    }
+  }
+
+  if (requestBatch.length > 0) {
+    await Promise.all(requestBatch);
+  }
+
+  await axios.post(
+    `${BACKEND_URL}/inventory/cleanup`,
+    {
+      company_guid: ACTIVE_COMPANY_GUID,
+      existing_ids: itemGuids
+    },
+    authHeaders()
+  );
+
+  console.log("🧹 Inventory cleanup completed");
+  console.log("✅ Full inventory synced:", itemGuids.length);
+}
+
+
+
+
+
+//inventory data outward inwards 
+
+async function syncInventoryMovements() {
+
+  if (!ACTIVE_COMPANY_GUID) return;
+
+  console.log("📦 Syncing Inventory Movements...");
+
+  const xml = `
+<ENVELOPE>
+ <HEADER>
+  <TALLYREQUEST>Export Data</TALLYREQUEST>
+ </HEADER>
+ <BODY>
+  <EXPORTDATA>
+   <REQUESTDESC>
+    <REPORTNAME>Day Book</REPORTNAME>
+    <STATICVARIABLES>
+     <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+     <SVFROMDATE>20240401</SVFROMDATE>
+     <SVTODATE>20251231</SVTODATE>
+     <SVCURRENTCOMPANY>${ACTIVE_COMPANY_NAME}</SVCURRENTCOMPANY>
+    </STATICVARIABLES>
+   </REQUESTDESC>
+  </EXPORTDATA>
+ </BODY>
+</ENVELOPE>
+`;
+
+  const res = await axios.post(TALLY_URL, xml, {
+    headers: { "Content-Type": "text/xml" }
+  });
+
+  if (res.data.includes("<LINEERROR>")) {
+    throw new Error("Inventory movement report error");
+  }
+
+  const parsed = await parseStringPromise(res.data);
+
+  const messages =
+    parsed?.ENVELOPE?.BODY?.[0]
+      ?.IMPORTDATA?.[0]
+      ?.REQUESTDATA?.[0]
+      ?.TALLYMESSAGE || [];
+
+  const msgArray = Array.isArray(messages) ? messages : [messages];
+
+  console.log("📦 Inventory vouchers:", msgArray.length);
+
+  const requestBatch = [];
+  let synced = 0;
+
+  for (const msg of msgArray) {
+
+    const v = msg.VOUCHER?.[0];
+    if (!v) continue;
+
+    const voucherType = v.VOUCHERTYPENAME?.[0];
+    const voucherDate = v.DATE?.[0];
+
+    if (!["Sales", "Purchase"].includes(voucherType)) continue;
+
+    const invEntries = [
+      ...(Array.isArray(v["ALLINVENTORYENTRIES.LIST"])
+        ? v["ALLINVENTORYENTRIES.LIST"]
+        : v["ALLINVENTORYENTRIES.LIST"]
+        ? [v["ALLINVENTORYENTRIES.LIST"]]
+        : []),
+
+      ...(Array.isArray(v["INVENTORYENTRIES.LIST"])
+        ? v["INVENTORYENTRIES.LIST"]
+        : v["INVENTORYENTRIES.LIST"]
+        ? [v["INVENTORYENTRIES.LIST"]]
+        : [])
+    ];
+
+    if (!invEntries.length) continue;
+
+    const movementType =
+      voucherType === "Purchase" ? "IN" :
+      voucherType === "Sales" ? "OUT" : null;
+
+    if (!movementType) continue;
+
+    for (const e of invEntries) {
+
+      const itemName = e.STOCKITEMNAME?.[0];
+      if (!itemName) continue;
+
+      const qty = parseTallyNumber(
+        e.BILLEDQTY?.[0] ||
+        e.ACTUALQTY?.[0] ||
+        "0"
+      );
+
+      if (!qty) continue;
+
+      const payload = {
+        company_guid: ACTIVE_COMPANY_GUID,
+        item_name: itemName,
+        qty: Math.abs(qty),
+        movement_type: movementType,
+        voucher_type: voucherType,
+        voucher_date: voucherDate
+      };
+
+      requestBatch.push(
+        axios.post(
+          `${BACKEND_URL}/inventory/inventory-movement/sync`,
+          payload,
+          authHeaders()
+        )
+      );
+
+      if (requestBatch.length >= 50) {
+        await Promise.all(requestBatch);
+        requestBatch.length = 0;
+      }
+
+      synced++;
+    }
+  }
+
+  if (requestBatch.length > 0) {
+    await Promise.all(requestBatch);
+  }
+
+  console.log("✅ Inventory movements synced:", synced);
+}
+
+
+
+
+
+
+function parseTallyNumber(val = "0") {
+
+  if (val === null || val === undefined) return 0;
+
+  // 🔥 Handle xml2js object format { _: "-1500.00", $: {...} }
+  if (typeof val === "object") {
+    if (val._ !== undefined) {
+      val = val._;
+    } else {
+      return 0;
+    }
+  }
+
+  // Ensure string
+  val = String(val);
+
+  return Number(
+    val
+      .replace(/\(/g, "-")
+      .replace(/\)/g, "")
+      .replace(/,/g, "")
+      .replace(/[^0-9.-]/g, "")
+  );
+}
+
+/* --------------------------
+   6. SYNC PROFIT & LOSS (MONTHLY)
+--------------------------- */
+
+async function syncProfitLossMonthly() {
+  if (!ACTIVE_COMPANY_GUID) return;
+
+  console.log("📊 Syncing Monthly Profit & Loss...");
+
+  // 🔹 Define start year (change if needed)
+  const startYear = 2025;
+  const now = new Date();
+
+  // Loop month-wise till current month
+  for (let year = startYear; year <= now.getFullYear(); year++) {
+    for (let month = 0; month < 12; month++) {
+
+      const fromDateObj = new Date(year, month, 1);
+      const toDateObj = new Date(year, month + 1, 0);
+
+      if (fromDateObj > now) break;
+
+      const fromDate = fromDateObj.toISOString().slice(0,10).replace(/-/g,"");
+      const toDate = toDateObj.toISOString().slice(0,10).replace(/-/g,"");
+
+      const xmlRequest = `
+<ENVELOPE>
+ <HEADER>
+  <TALLYREQUEST>Export Data</TALLYREQUEST>
+ </HEADER>
+ <BODY>
+  <EXPORTDATA>
+   <REQUESTDESC>
+    <REPORTNAME>Profit & Loss A/c</REPORTNAME>
+    <STATICVARIABLES>
+      <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+      <SVCURRENTCOMPANY>${ACTIVE_COMPANY_NAME}</SVCURRENTCOMPANY>
+      <SVFROMDATE>${fromDate}</SVFROMDATE>
+      <SVTODATE>${toDate}</SVTODATE>
+    </STATICVARIABLES>
+   </REQUESTDESC>
+  </EXPORTDATA>
+ </BODY>
+</ENVELOPE>
+`;
+
+      try {
+        const res = await axios.post(TALLY_URL, xmlRequest, {
+          headers: { "Content-Type": "text/xml" }
+        });
+
+        if (res.data.includes("<LINEERROR>")) {
+          console.log("⚠️ P&L report error for", fromDate);
+          continue;
+        }
+
+        const parsed = await parseStringPromise(res.data);
+
+        // 🔥 Extract Net Profit / Net Loss safely
+        // ✅ Extract NETPROFIT directly from Tally XML
+let netAmount = 0;
+let type = "PROFIT";
+
+const netProfitValue =
+  parsed?.ENVELOPE?.BODY?.[0]?.DATA?.[0]?.COLLECTION?.[0]?.NETPROFIT?.[0] ||
+  parsed?.ENVELOPE?.BODY?.[0]?.DATA?.[0]?.NETPROFIT?.[0] ||
+  parsed?.ENVELOPE?.BODY?.[0]?.DATA?.[0]?.DSPNETPROFIT?.[0];
+
+if (netProfitValue) {
+  netAmount = parseTallyNumber(netProfitValue);
+  type = netAmount >= 0 ? "PROFIT" : "LOSS";
+}
+
+
+        const payload = {
+          company_guid: ACTIVE_COMPANY_GUID,
+          month: `${year}-${String(month+1).padStart(2,"0")}`,
+          from_date: fromDate,
+          to_date: toDate,
+          net_amount: Math.abs(netAmount),
+          type
+        };
+
+       if (netAmount !== 0) {
+  console.log("📤 P&L:", payload);
+}
+
+        await axios.post(
+          `${BACKEND_URL}/api/reports/profit-loss/sync`,
+          payload,
+          authHeaders()
+        );
+
+      } catch (err) {
+        console.error("❌ P&L sync error:", err.message);
+      }
+    }
+  }
+
+  console.log("✅ Profit & Loss Monthly Sync Complete");
+}
+
+ 
+/* --------------------------
+  bills add to tally  Logic
+--------------------------- */
+async function processBillCommands() {
+  if (!ACTIVE_COMPANY_GUID) return;
+
+  const res = await axios.get(
+    `${BACKEND_URL}/sync-queue/pending-bills?company_guid=${ACTIVE_COMPANY_GUID}`,
+    authHeaders()
+  );
+
+  const commands = res.data || [];
+console.log("🧾 Pending bill commands:", commands.length);
+
+ for (const cmd of commands) {
+  const { id, payload } = cmd;
+
+  try {
+    await axios.post(
+      `${BACKEND_URL}/sync-queue/${id}/processing`,
+      {},
+      authHeaders()
+    );
+
+    await axios.post(
+      `${BACKEND_URL}/bill/mark-processing`,
+      {
+        bill_name: payload.bill_name,
+        company_guid: ACTIVE_COMPANY_GUID
+      },
+      authHeaders()
+    );
+
+    const xml = generateTallyBillXML(payload, ACTIVE_COMPANY_NAME);
+
+    const tallyRes = await axios.post(TALLY_URL, xml, {
+      headers: { "Content-Type": "text/xml" }
+    });
+
+    if (tallyRes.data.includes("<LINEERROR>")) {
+      throw new Error("Tally bill error");
+    }
+
+    await axios.post(
+      `${BACKEND_URL}/sync-queue/${id}/success`,
+      {},
+      authHeaders()
+    );
+
+    await axios.post(
+      `${BACKEND_URL}/bill/mark-success`,
+      {
+        bill_name: payload.bill_name,
+        company_guid: ACTIVE_COMPANY_GUID
+      },
+      authHeaders()
+    );
+
+    console.log("✅ Bill pushed:", payload.bill_name);
+
+  } catch (err) {
+    await axios.post(
+      `${BACKEND_URL}/sync-queue/${id}/failed`,
+      { error: err.message },
+      authHeaders()
+    );
+
+    await axios.post(
+      `${BACKEND_URL}/bill/mark-failed`,
+      {
+        bill_name: payload.bill_name,
+        company_guid: ACTIVE_COMPANY_GUID,
+        error: err.message
+      },
+      authHeaders()
+    );
+
+    console.error("❌ Bill failed:", payload.bill_name, err.message);
+  }
+}
+
+}
+
+/* --------------------------
+   Restore ledger in tally 
+--------------------------- */
+
+function escapeXML(value) {
+  if (!value) return "";
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+app.post("/tally/ledger/create", async (req, res) => {
+
+  const {
+    name,
+    parent_group,
+    opening_balance,
+    email,
+    phone
+  } = req.body;
+
+  if (!name) {
+  return res.status(400).json({
+    error: "Ledger name is required"
+  });
+}
+
+  try {
+
+    const xml = `
+<ENVELOPE>
+  <HEADER>
+    <TALLYREQUEST>Import Data</TALLYREQUEST>
+  </HEADER>
+  <BODY>
+    <IMPORTDATA>
+      <REQUESTDESC>
+        <REPORTNAME>All Masters</REPORTNAME>
+      </REQUESTDESC>
+      <REQUESTDATA>
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+            <LEDGER NAME="${escapeXML(name)}" ACTION="Create">
+  <NAME>${escapeXML(name)}</NAME>
+  <PARENT>${escapeXML(parent_group || "Sundry Debtors")}</PARENT>
+  <EMAIL>${escapeXML(email || "")}</EMAIL>
+  <PHONENUMBER>${escapeXML(phone || "")}</PHONENUMBER>
+            <OPENINGBALANCE>${opening_balance || 0}</OPENINGBALANCE>
+          </LEDGER>
+        </TALLYMESSAGE>
+      </REQUESTDATA>
+    </IMPORTDATA>
+  </BODY>
+</ENVELOPE>
+`;
+
+    const response = await fetch("http://localhost:9000", {
+      method: "POST",
+      headers: { "Content-Type": "text/xml" },
+      body: xml
+    });
+
+    const text = await response.text();
+
+    res.json({
+      success: true,
+      tally_response: text
+    });
+
+  } catch (err) {
+    console.error("Tally create ledger failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+
+});
+
+
+/* --------------------------
+  Restore voucher
+--------------------------- */
+
+
+app.post("/tally/voucher/create", async (req, res) => {
+
+  const {
+    voucher_guid,
+    voucher_type,
+    voucher_date,
+    narration,
+    ledger_entries,
+    company_name
+  } = req.body;
+
+  if (!voucher_type || !voucher_date || !ledger_entries?.length) {
+    return res.status(400).json({
+      error: "voucher_type, voucher_date and ledger_entries required"
+    });
+  }
+
+  try {
+
+    const date = voucher_date.replace(/-/g, "");
+
+    const ledgerXML = ledger_entries.map(e => {
+
+      const isDeemedPositive = e.is_debit ? "No" : "Yes";
+
+      const amount = e.is_debit
+        ? Math.abs(e.amount)
+        : -Math.abs(e.amount);
+
+      return `
+<ALLLEDGERENTRIES.LIST>
+  <LEDGERNAME>${escapeXML(e.ledger_name)}</LEDGERNAME>
+  <ISDEEMEDPOSITIVE>${isDeemedPositive}</ISDEEMEDPOSITIVE>
+  <AMOUNT>${amount}</AMOUNT>
+</ALLLEDGERENTRIES.LIST>
+`;
+
+    }).join("");
+
+    const xml = `
+<ENVELOPE>
+ <HEADER>
+  <TALLYREQUEST>Import Data</TALLYREQUEST>
+ </HEADER>
+
+ <BODY>
+  <IMPORTDATA>
+   <REQUESTDESC>
+    <REPORTNAME>Vouchers</REPORTNAME>
+
+    <STATICVARIABLES>
+      <SVCOMPANY>${escapeXML(company_name)}</SVCOMPANY>
+    </STATICVARIABLES>
+
+   </REQUESTDESC>
+
+   <REQUESTDATA>
+
+    <TALLYMESSAGE>
+
+     <VOUCHER VCHTYPE="${escapeXML(voucher_type)}" ACTION="Create">
+
+      <DATE>${date}</DATE>
+      <EFFECTIVEDATE>${date}</EFFECTIVEDATE>
+
+      <VOUCHERTYPENAME>${escapeXML(voucher_type)}</VOUCHERTYPENAME>
+
+      <PERSISTEDVIEW>Accounting Voucher View</PERSISTEDVIEW>
+
+      ${voucher_guid ? `<GUID>${voucher_guid}</GUID>` : ""}
+
+      ${narration ? `<NARRATION>${escapeXML(narration)}</NARRATION>` : ""}
+
+      ${ledgerXML}
+
+     </VOUCHER>
+
+    </TALLYMESSAGE>
+
+   </REQUESTDATA>
+
+  </IMPORTDATA>
+ </BODY>
+</ENVELOPE>
+`;
+
+    const response = await fetch("http://localhost:9000", {
+      method: "POST",
+      headers: { "Content-Type": "text/xml" },
+      body: xml
+    });
+
+    const text = await response.text();
+
+    res.json({
+      success: true,
+      tally_response: text
+    });
+
+  } catch (err) {
+    console.error("Voucher restore failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+
+});
+
+/* --------------------------
+   START AUTO SYNC
+--------------------------- */
+let companiesSynced = false;
+
+
+async function getSelectedCompanies() {
+  try {
+    const res = await axios.get(
+      `${BACKEND_URL}/company/selected`,
+      authHeaders()
+    );
+
+    if (res.data.success) {
+      return res.data.data;
+    }
+
+    return [];
+  } catch (err) {
+    console.error("❌ Failed to fetch selected companies:", err.message);
+    return [];
+  }
+}
+
+
+
+
+
+
+async function syncAllData() {
+
+    if (isSyncRunning) {
+    console.log("⏳ Previous sync still running. Skipping...");
+    return;
+  }
+
+  isSyncRunning = true;
+
+  console.log("🔄 Sync started...");
+
+  try {
+    // 🔹 Step 1: Sync ALL companies into DB (no restriction)
+await syncCompanies();
+
+// 🔹 Step 2: Get ONLY selected companies
+const companies = await getSelectedCompanies();
+
+if (!companies.length) {
+  console.log("⚠️ No companies selected. Skipping data pull.");
+  return;
+}
+
+for (const company of companies) {
+  console.log("🔐 Syncing company:", company.name);
+
+  ACTIVE_COMPANY_GUID = company.company_guid;
+  ACTIVE_COMPANY_NAME = company.name;
+
+// 🔒 Check license-based resync restriction
+const plan = await getLicensePlan();
+const allowedInterval =
+  PLAN_SYNC_INTERVALS[plan] || PLAN_SYNC_INTERVALS["Starter"];
+
+let lastSync = null;
+
+try {
+  const statusRes = await axios.get(
+    `${BACKEND_URL}/agent-status/sync-status?company_guid=${ACTIVE_COMPANY_GUID}`,
+    authHeaders()
+  );
+
+  lastSync = statusRes.data?.last_sync_at;
+} catch (err) {
+  console.log("⚠️ Could not fetch last sync time");
+}
+
+if (lastSync) {
+  const lastSyncTime = new Date(lastSync).getTime();
+  const nextSyncTime = lastSyncTime + allowedInterval;
+  const now = Date.now();
+
+  if (now < nextSyncTime) {
+    const remainingMs = nextSyncTime - now;
+
+    console.log(`⏳ Resync blocked for ${company.name}`);
+    console.log(`📦 Plan: ${plan}`);
+    console.log(`🕒 Last Sync: ${new Date(lastSyncTime).toLocaleString()}`);
+    console.log(`⏭ Next Allowed Sync: ${new Date(nextSyncTime).toLocaleString()}`);
+    console.log(`⏳ Time Remaining: ${formatDuration(remainingMs)}\n`);
+
+    continue;
+  }
+}
+
+
+
+  // 🔄 Notify backend that sync has STARTED
+try {
+  await axios.post(
+    `${BACKEND_URL}/agent-status/sync-started`,
+    { company_guid: company.company_guid },
+    authHeaders()
+  );
+} catch (err) {
+  console.error("⚠️ Sync-started update failed:", err.message);
+}
+
+      // STEP-2: ONLY ledger sync
+      console.log("➡️ STEP 1: syncLedgers");
+      await syncLedgers(company);
+     
+         
+
+ console.log("➡️ STEP 2: syncVouchers");
+      await syncVouchers();
+
+      console.log("➡️ STEP 3: syncSalesOrders");
+await syncOrders();
+
+         console.log("➡️ STEP 4: syncInventoryMovements");
+
+await syncInventoryMovements();
+
+console.log("➡️ STEP 5: fetchfullStockSummary");
+      await fetchFullStockData();
+
+ //    console.log("➡️ STEP 6: syncProfitLossMonthly");
+//await syncProfitLossMonthly();
+
+
+      console.log("➡️ STEP 6: processCreateToTallyCommands");
+      await processVoucherCommands();
+      await processLedgerCommands();
+      console.log("➡️ STEP 7: processBillCommands");
+      await processBillCommands();
+     
+try {
+  await syncBills();
+   await syncBillsPayable();
+} catch (err) {
+  console.error("⚠️ Bills sync failed (non-blocking):", err.message);
+  }
+
+      // ✅ THIS IS THE FIX
+      try {
+        await axios.post(
+          `${BACKEND_URL}/agent-status/sync-status`,
+          { company_guid: company.company_guid },
+          authHeaders()
+        );
+
+        const nextSyncTime = Date.now() + allowedInterval;
+
+console.log(`✅ Sync completed for ${company.name}`);
+console.log(`⏭ Next scheduled sync at: ${new Date(nextSyncTime).toLocaleString()}`);
+console.log(`⏱ In: ${formatDuration(allowedInterval)}\n`);
+
+
+      } catch (err) {
+        console.error("⚠️ Sync status update failed:", err.message);
+      }
+    }
+
+    console.log("✅ Sync complete!\n");
+  } catch (err) {
+  console.error("⛔ SYNC FAILED");
+  console.error("STATUS:", err.response?.status);
+  console.error("DATA:", err.response?.data);
+  console.error("MESSAGE:", err.message);
+} finally {
+  isSyncRunning = false;
+}
+
+}
+
+
+(async () => {
+  console.log("\n🟢 TallyScrapper Middleware starting...\n");
+
+  await startAuthenticationFlow();
+
+  const plan = await getLicensePlan();
+  SYNC_INTERVAL = PLAN_SYNC_INTERVALS[plan] || PLAN_SYNC_INTERVALS["Starter"];
+
+  console.log(`📦 Plan: ${plan}`);
+  console.log(`⏱ Sync Interval: ${SYNC_INTERVAL / 60000} minutes`);
+
+  await syncAllData();
+
+  async function startSyncLoop() {
+  while (true) {
+    await syncAllData();
+    await new Promise(r => setTimeout(r, SYNC_INTERVAL));
+  }
+}
+
+startSyncLoop();
+})();

@@ -1,0 +1,5 @@
+{
+  "backend_url": "http://localhost:4000",
+  "username": "admin1",
+  "password": "admin1password"
+}
