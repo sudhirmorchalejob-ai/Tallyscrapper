@@ -3,6 +3,7 @@ require("dotenv").config({ quiet: true });
 const axios = require("axios");
 const Agent = require("agentkeepalive");
 const xml2js = require("xml2js");
+const sax = require("sax");
 const { parseStringPromise } = xml2js;
 const { Pool } = require("pg");
 const fs = require("fs");
@@ -11,6 +12,28 @@ const os = require("os");
 const crypto = require("crypto");
 const readline = require("readline");
 const { exec } = require("child_process");
+
+try {
+  require("v8").setFlagsFromString("--max-old-space-size=4096");
+} catch (e) {}
+
+process.on("unhandledRejection", (err) => {
+  try {
+    structuredLog("error", "UNHANDLED REJECTION", {
+      error: err && err.message ? err.message : String(err)
+    });
+  } catch {}
+});
+
+process.on("uncaughtException", (err) => {
+  try {
+    structuredLog("error", "UNCAUGHT EXCEPTION", {
+      error: err && err.message ? err.message : String(err),
+      stack: err && err.stack ? err.stack : null
+    });
+  } catch {}
+  process.exit(1);
+});
 
 const DEBUG = false;
 
@@ -98,7 +121,7 @@ async function postTallyXml(xmlData, options = {}) {
 function getMonthlyChunks(startYear = null) {
   const now = new Date();
   const currentYear = now.getFullYear();
-  const fromYear = startYear || (currentYear - 3);
+  const fromYear = startYear || (currentYear - 1);
 
   const chunks = [];
   const cur = new Date(fromYear, 3, 1); // Start from April 1st of startYear (Financial Year start)
@@ -619,6 +642,437 @@ function saveState(state) {
 }
 
 // ============================================================
+//  STRUCTURED LOGGING & SAFE DB WRITES
+// ============================================================
+const LOG_DIR = path.join(os.homedir(), "tally-agent-logs");
+let SYNC_RUN_ID = null;
+
+function ensureLogDir() {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+  } catch {}
+}
+
+function todayStamp() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function logFilePath(prefix) {
+  return path.join(LOG_DIR, `${prefix}-${todayStamp()}.log`);
+}
+
+function writeJsonLine(file, entry) {
+  ensureLogDir();
+  try {
+    fs.appendFileSync(file, JSON.stringify(entry) + "\n");
+  } catch {}
+}
+
+function structuredLog(level, msg, meta = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    msg,
+    syncId: SYNC_RUN_ID,
+    ...meta
+  };
+  writeJsonLine(logFilePath("sync"), entry);
+  const suffix = Object.keys(meta).length ? " " + JSON.stringify(meta) : "";
+  console.log(`[${level.toUpperCase()}] ${msg}${suffix}`);
+}
+
+function logFailure(entity, identifier, error, meta = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    syncId: SYNC_RUN_ID,
+    entity,
+    identifier,
+    error: (error && (error.message || error)) || String(error),
+    stack: (error && error.stack) || null,
+    ...meta
+  };
+  writeJsonLine(logFilePath("failures"), entry);
+  structuredLog("error", `[${entity}] Failed record: ${identifier}`, {
+    error: entry.error
+  });
+}
+
+function formatDuration(ms) {
+  if (ms < 1000) return `${ms}ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(2)}s`;
+  return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+}
+
+function fmtBytes(n) {
+  if (!n) return "0 B";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function summarizeRecord(record) {
+  if (!record || typeof record !== "object") return record;
+  const { payload, ...rest } = record;
+  return rest;
+}
+
+const SYNC_SUMMARY = {
+  startedAt: null,
+  endedAt: null,
+  companiesSynced: 0,
+  entities: {}
+};
+
+function recordEntityStats(entity, { fetched = 0, saved = 0, failed = 0, skipped = 0 } = {}) {
+  const prev = SYNC_SUMMARY.entities[entity] || { fetched: 0, saved: 0, failed: 0, skipped: 0 };
+  SYNC_SUMMARY.entities[entity] = {
+    fetched: prev.fetched + fetched,
+    saved: prev.saved + saved,
+    failed: prev.failed + failed,
+    skipped: prev.skipped + skipped
+  };
+}
+
+function printSyncSummary(syncStart) {
+  const dur = Date.now() - syncStart;
+  structuredLog("info", "Sync summary", {
+    startedAt: SYNC_SUMMARY.startedAt ? SYNC_SUMMARY.startedAt.toISOString() : null,
+    endedAt: SYNC_SUMMARY.endedAt ? SYNC_SUMMARY.endedAt.toISOString() : null,
+    durationMs: dur,
+    duration: formatDuration(dur),
+    companies: SYNC_SUMMARY.companiesSynced,
+    entities: SYNC_SUMMARY.entities
+  });
+
+  console.log("\n========== SYNC SUMMARY ==========");
+  console.log(`Started   : ${SYNC_SUMMARY.startedAt ? SYNC_SUMMARY.startedAt.toISOString() : "N/A"}`);
+  console.log(`Ended     : ${SYNC_SUMMARY.endedAt ? SYNC_SUMMARY.endedAt.toISOString() : "N/A"}`);
+  console.log(`Duration  : ${formatDuration(dur)}`);
+  console.log(`Companies : ${SYNC_SUMMARY.companiesSynced}`);
+  console.log("");
+  console.log("Entity                    Fetched    Saved   Failed  Skipped");
+  for (const [entity, s] of Object.entries(SYNC_SUMMARY.entities)) {
+    console.log(
+      `${entity.padEnd(24)} ${String(s.fetched).padStart(8)} ${String(s.saved).padStart(7)} ${String(s.failed).padStart(7)} ${String(s.skipped).padStart(7)}`
+    );
+  }
+  console.log("================================");
+}
+
+// ============================================================
+//  TALLY FETCH WRAPPER (retries + structured logs)
+// ============================================================
+async function fetchTallyXml(xmlData, { entity = "tally", timeout = 600000 } = {}) {
+  const t0 = Date.now();
+  structuredLog("info", `[${entity}] FETCH: requesting data from Tally`);
+
+  const heartbeatMs = 5000;
+  const heartbeat = setInterval(() => {
+    const elapsed = formatDuration(Date.now() - t0);
+    console.log(`[INFO] [${entity}] FETCH: still waiting for Tally... ${elapsed} elapsed (timeout ${Math.round(timeout / 1000)}s)`);
+    const entry = {
+      ts: new Date().toISOString(),
+      level: "info",
+      msg: `[${entity}] FETCH: still waiting for Tally... ${elapsed} elapsed`,
+      syncId: SYNC_RUN_ID
+    };
+    writeJsonLine(logFilePath("sync"), entry);
+  }, heartbeatMs);
+  if (heartbeat.unref) heartbeat.unref();
+
+  try {
+    const res = await postTallyXml(xmlData, { timeout });
+    structuredLog("info", `[${entity}] FETCH: response received`, {
+      duration: formatDuration(Date.now() - t0),
+      size: fmtBytes(res && res.data ? res.data.length : 0)
+    });
+    return res;
+  } catch (err) {
+    structuredLog("error", `[${entity}] FETCH: failed`, {
+      error: err.message,
+      duration: formatDuration(Date.now() - t0)
+    });
+    throw err;
+  } finally {
+    clearInterval(heartbeat);
+  }
+}
+
+// ============================================================
+//  STREAMING VOUCHER FETCH (memory-safe for very large data)
+//  Reads Tally's response chunk-by-chunk through a SAX parser,
+//  emitting one VOUCHER at a time. No DOM tree is ever built, so
+//  memory stays flat no matter the response size (300MB, 1GB, ...).
+// ============================================================
+function saxVoucherStream(onVoucher) {
+  const stack = [];
+  const parser = sax.parser(true, { trim: true });
+
+  function buildValue(el) {
+    if (!el.children.length) return (el.text || "").trim();
+    const obj = {};
+    const groups = {};
+    for (const child of el.children) {
+      (groups[child.name] = groups[child.name] || []).push(child);
+    }
+    for (const name of Object.keys(groups)) {
+      obj[name] = groups[name].map((c) => buildValue(c));
+    }
+    return obj;
+  }
+
+  parser.onopentag = (node) => {
+    stack.push({ name: node.name, children: [], text: "" });
+  };
+
+  parser.ontext = (t) => {
+    if (stack.length && t) {
+      const top = stack[stack.length - 1];
+      if (!top.children.length) top.text += t;
+    }
+  };
+
+  parser.onclosetag = () => {
+    const el = stack.pop();
+    const parent = stack[stack.length - 1];
+    if (!parent) return;
+    if (el.name === "VOUCHER") {
+      try {
+        onVoucher(buildValue(el));
+      } catch (err) {
+        structuredLog("error", "[vouchers] Failed to process voucher from stream", {
+          error: err.message
+        });
+      }
+    } else {
+      parent.children.push(el);
+    }
+  };
+
+  parser.onerror = () => {
+    try {
+      parser.resume();
+    } catch {}
+  };
+
+  return parser;
+}
+
+async function fetchVouchersStream(xmlData, onVoucher) {
+  const t0 = Date.now();
+  const retries = 3;
+  const timeout = 600000;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const heartbeat = setInterval(() => {
+      const elapsed = formatDuration(Date.now() - t0);
+      console.log(`[INFO] [vouchers] FETCH: still streaming from Tally... ${elapsed} elapsed (attempt ${attempt}/${retries})`);
+      const entry = {
+        ts: new Date().toISOString(),
+        level: "info",
+        msg: `[vouchers] FETCH: still streaming from Tally... ${elapsed} elapsed`,
+        syncId: SYNC_RUN_ID
+      };
+      writeJsonLine(logFilePath("sync"), entry);
+    }, 5000);
+    if (heartbeat.unref) heartbeat.unref();
+
+    try {
+      const res = await axios.post(TALLY_URL, xmlData, {
+        headers: { "Content-Type": "text/xml" },
+        timeout,
+        responseType: "stream"
+      });
+
+      const parser = saxVoucherStream(onVoucher);
+      let bytes = 0;
+
+      await new Promise((resolve, reject) => {
+        res.data.on("data", (chunk) => {
+          bytes += chunk.length;
+          try {
+            parser.write(chunk);
+          } catch (e) {
+            reject(e);
+          }
+        });
+        res.data.on("end", () => {
+          try {
+            parser.close();
+            resolve();
+          } catch (e) {
+            reject(e);
+          }
+        });
+        res.data.on("error", (err) => reject(err));
+      });
+
+      clearInterval(heartbeat);
+      structuredLog("info", "[vouchers] FETCH: response received", {
+        duration: formatDuration(Date.now() - t0),
+        size: fmtBytes(bytes),
+        attempt
+      });
+      return { bytes };
+    } catch (err) {
+      clearInterval(heartbeat);
+      lastErr = err;
+      structuredLog("warn", `[vouchers] FETCH: stream failed (attempt ${attempt}/${retries})`, {
+        error: err.message
+      });
+      if (attempt < retries) await sleep(2000);
+    }
+  }
+  throw lastErr;
+}
+
+// ============================================================
+//  SAFE BATCH WRITES (per-record isolation + retries)
+// ============================================================
+function buildBatchValues(rows, columns) {
+  const placeholders = rows
+    .map((_, rIdx) => `(${columns.map((_, cIdx) => `$${rIdx * columns.length + cIdx + 1}`).join(",")})`)
+    .join(",");
+  const values = rows.flatMap((r) =>
+    columns.map((c) => (r[c] === undefined || r[c] === "" ? null : r[c]))
+  );
+  return { placeholders, values };
+}
+
+function buildUpsertStatement({ table, columns, rows, conflict, updateColumns }) {
+  const { placeholders, values } = buildBatchValues(rows, columns);
+  const conflictTarget = Array.isArray(conflict) ? `(${conflict.join(", ")})` : conflict;
+  let sql;
+  if (updateColumns && updateColumns.length) {
+    const setClause = updateColumns.map((c) => `"${c}" = EXCLUDED."${c}"`).join(", ");
+    sql = `INSERT INTO "${table}" (${columns.map((c) => `"${c}"`).join(", ")})
+           VALUES ${placeholders}
+           ON CONFLICT ${conflictTarget} DO UPDATE SET ${setClause}`;
+  } else {
+    sql = `INSERT INTO "${table}" (${columns.map((c) => `"${c}"`).join(", ")})
+           VALUES ${placeholders}
+           ON CONFLICT ${conflictTarget} DO NOTHING`;
+  }
+  return { sql, values };
+}
+
+function buildInsertStatement({ table, columns, rows }) {
+  const { placeholders, values } = buildBatchValues(rows, columns);
+  const sql = `INSERT INTO "${table}" (${columns.map((c) => `"${c}"`).join(", ")})
+               VALUES ${placeholders}`;
+  return { sql, values };
+}
+
+let _savepointCounter = 0;
+
+function isTransientDbError(err) {
+  if (!err) return false;
+  const code = String(err.code || "");
+  if (/^(08|40|57)/.test(code)) return true;
+  const msg = `${err.message || ""} ${err.code || ""}`;
+  return /(ECONNRESET|ETIMEDOUT|EPIPE|EHOSTUNREACH|ENETUNREACH|connection (terminated|closed|reset)|socket hang up|timeout expired)/i.test(msg);
+}
+
+async function runSqlIsolated(db, inTx, sql, values) {
+  if (inTx) {
+    const sp = `sav_${_savepointCounter++}`;
+    await db.query(`SAVEPOINT ${sp}`);
+    try {
+      await db.query(sql, values);
+      await db.query(`RELEASE SAVEPOINT ${sp}`);
+      return { ok: true };
+    } catch (err) {
+      try {
+        await db.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+      } catch (rollbackErr) {
+        throw err;
+      }
+      return { ok: false, error: err };
+    }
+  }
+  try {
+    await db.query(sql, values);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err };
+  }
+}
+
+async function runSqlWithTransientRetry({ db, inTx, sql, values, entity, attempts = 3 }) {
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const res = await runSqlIsolated(db, inTx, sql, values);
+    if (res.ok) return res;
+    lastErr = res.error;
+    if (!isTransientDbError(lastErr)) return res;
+    if (attempt < attempts) {
+      structuredLog("warn", `[${entity}] Transient DB error, retrying (${attempt}/${attempts})`, {
+        error: lastErr.message,
+        code: lastErr.code
+      });
+      await sleep(1000 * attempt);
+    }
+  }
+  return { ok: false, error: lastErr };
+}
+
+async function oneBatchSafe({ db, inTx, buildStatement, table, columns, rows, conflict, updateColumns, entity, idFn, depth = 0 }) {
+  const { sql, values } = buildStatement({ table, columns, rows, conflict, updateColumns });
+  const res = await runSqlWithTransientRetry({ db, inTx, sql, values, entity });
+  if (res.ok) return { synced: rows.length, failed: [] };
+
+  if (rows.length === 1) {
+    const record = rows[0];
+    const identifier = idFn ? idFn(record) : "<unknown>";
+    logFailure(entity, identifier, res.error, { table, record: summarizeRecord(record) });
+    return { synced: 0, failed: [{ identifier, error: res.error }] };
+  }
+
+  const mid = Math.floor(rows.length / 2);
+  const left = await oneBatchSafe({ db, inTx, buildStatement, table, columns, rows: rows.slice(0, mid), conflict, updateColumns, entity, idFn, depth: depth + 1 });
+  const right = await oneBatchSafe({ db, inTx, buildStatement, table, columns, rows: rows.slice(mid), conflict, updateColumns, entity, idFn, depth: depth + 1 });
+  return { synced: left.synced + right.synced, failed: [...left.failed, ...right.failed] };
+}
+
+async function writeRowsSafe({ db = pool, inTx = false, table, columns, rows, conflict, updateColumns, batchSize = 500, entity = table, idFn, onBatch }) {
+  if (!rows || !rows.length) return { synced: 0, failed: [], total: 0 };
+  const useUpsert = !!(conflict && conflict.length);
+  const buildStatement = useUpsert ? buildUpsertStatement : buildInsertStatement;
+  const total = rows.length;
+  let synced = 0;
+  const failed = [];
+
+  for (let i = 0; i < total; i += batchSize) {
+    const batch = rows.slice(i, i + batchSize);
+    const batchStart = i + 1;
+    const batchEnd = Math.min(i + batchSize, total);
+    const t0 = Date.now();
+
+    const r = await oneBatchSafe({ db, inTx, buildStatement, table, columns, rows: batch, conflict, updateColumns, entity, idFn });
+    synced += r.synced;
+    failed.push(...r.failed);
+
+    structuredLog("info", `[${entity}] SAVE progress: ${synced}/${total} records synced`, {
+      saved: synced,
+      failed: failed.length,
+      remaining: total - synced - failed.length,
+      batch: `${batchStart}-${batchEnd}`,
+      batchMs: Date.now() - t0
+    });
+
+    if (onBatch) onBatch({ synced, failed: failed.length, batchEnd, total });
+  }
+
+  return { synced, failed, total };
+}
+
+// ============================================================
 //  DATABASE INIT (auto-create tables)
 // ============================================================
 const SCHEMA = `
@@ -776,38 +1230,22 @@ async function initDb() {
 }
 
 // Generic upsert (duplicate-free) with batching to prevent Postgres parameter overflow
-async function upsertRows({ table, columns, rows, conflict, updateColumns, batchSize = 500 }) {
+async function upsertRows({ table, columns, rows, conflict, updateColumns, batchSize = 500, db = null }) {
   if (!rows || !rows.length) return 0;
 
+  const q = db || pool;
   let totalSynced = 0;
+
   for (let i = 0; i < rows.length; i += batchSize) {
     const batch = rows.slice(i, i + batchSize);
-
-    const placeholders = batch
-      .map((_, bIdx) => `(${columns.map((_, cIdx) => `$${bIdx * columns.length + cIdx + 1}`).join(",")})`)
-      .join(",");
-
-    const values = batch.flatMap((r) =>
-      columns.map((c) => (r[c] === undefined || r[c] === "" ? null : r[c]))
-    );
-
-    const conflictTarget = Array.isArray(conflict)
-      ? `(${conflict.join(", ")})`
-      : conflict;
-
-    let sql;
-    if (updateColumns.length) {
-      const setClause = updateColumns.map((c) => `"${c}" = EXCLUDED."${c}"`).join(", ");
-      sql = `INSERT INTO "${table}" (${columns.map((c) => `"${c}"`).join(", ")})
-             VALUES ${placeholders}
-             ON CONFLICT ${conflictTarget} DO UPDATE SET ${setClause}`;
-    } else {
-      sql = `INSERT INTO "${table}" (${columns.map((c) => `"${c}"`).join(", ")})
-             VALUES ${placeholders}
-             ON CONFLICT ${conflictTarget} DO NOTHING`;
-    }
-
-    await pool.query(sql, values);
+    const { sql, values } = buildUpsertStatement({
+      table,
+      columns,
+      rows: batch,
+      conflict,
+      updateColumns
+    });
+    await q.query(sql, values);
     totalSynced += batch.length;
   }
 
@@ -815,10 +1253,11 @@ async function upsertRows({ table, columns, rows, conflict, updateColumns, batch
 }
 
 // Delete records for a company that no longer exist in Tally (uses single ANY array parameter)
-async function cleanupByGuids(table, companyGuid, guidColumn, guids) {
+async function cleanupByGuids(table, companyGuid, guidColumn, guids, db = null) {
   if (!guids || !guids.length) return;
+  const q = db || pool;
   const sql = `DELETE FROM "${table}" WHERE company_guid = $1 AND NOT (${guidColumn} = ANY($2::text[]))`;
-  const res = await pool.query(sql, [companyGuid, guids]);
+  const res = await q.query(sql, [companyGuid, guids]);
   console.log(`🧹 Cleanup ${table}: removed ${res.rowCount} missing records`);
 }
 
@@ -833,6 +1272,8 @@ function logSync(entity, records) {
 //  1. DETECT + CREATE COMPANIES
 // ============================================================
 async function detectCompanies() {
+  const t0 = Date.now();
+
   const xmlRequest = `
 <ENVELOPE>
  <HEADER>
@@ -859,7 +1300,7 @@ async function detectCompanies() {
 </ENVELOPE>
 `;
 
-  const response = await postTallyXml(xmlRequest);
+  const response = await fetchTallyXml(xmlRequest, { entity: "companies" });
 
   const jsonData = await parseStringPromise(response.data);
 
@@ -867,6 +1308,7 @@ async function detectCompanies() {
     jsonData?.ENVELOPE?.BODY?.[0]?.DATA?.[0]?.COLLECTION?.[0]?.COMPANY || [];
 
   const companyList = [];
+  let skipped = 0;
 
   for (const c of companies) {
     const company_guid =
@@ -874,18 +1316,29 @@ async function detectCompanies() {
     const name =
       typeof c.NAME?.[0] === "string" ? c.NAME[0] : c.NAME?.[0]?._;
 
-    if (!company_guid || !name) continue;
+    if (!company_guid || !name) {
+      skipped++;
+      continue;
+    }
 
     companyList.push({ company_guid, name, payload: c });
   }
 
+  structuredLog("info", `[companies] VALIDATE: ${companies.length} fetched, ${skipped} skipped, ${companyList.length} valid`);
+
   // 🔥 Auto-create companies in DB (duplicate-free upsert)
-  await upsertRows({
+  const res = await writeRowsSafe({
     table: "companies",
     columns: ["company_guid", "name", "payload"],
     rows: companyList,
     conflict: ["company_guid"],
-    updateColumns: ["name", "payload"]
+    updateColumns: ["name", "payload"],
+    entity: "companies",
+    idFn: (r) => r.company_guid
+  });
+
+  structuredLog("info", `[companies] COMPLETE: fetched=${companies.length} saved=${res.synced} failed=${res.failed.length} skipped=${skipped} remaining=0`, {
+    duration: formatDuration(Date.now() - t0)
   });
 
   console.log(
@@ -900,6 +1353,8 @@ async function detectCompanies() {
 //  2. SYNC LEDGERS
 // ============================================================
 async function syncLedgers(company) {
+  const t0 = Date.now();
+
   const xmlRequest = `
 <ENVELOPE>
  <HEADER>
@@ -942,9 +1397,7 @@ async function syncLedgers(company) {
 </ENVELOPE>
 `;
 
-  const res = await axios.post(TALLY_URL, xmlRequest, {
-    headers: { "Content-Type": "text/xml" }
-  });
+  const res = await fetchTallyXml(xmlRequest, { entity: "ledgers" });
 
   const parser = new xml2js.Parser({ explicitArray: false });
   const parsed = await parser.parseStringPromise(res.data);
@@ -956,6 +1409,7 @@ async function syncLedgers(company) {
 
   const ledgerRows = [];
   const ledgerGuids = [];
+  let skipped = 0;
 
   for (const l of ledgerArray) {
     let mailingAddressText = null;
@@ -980,6 +1434,7 @@ async function syncLedgers(company) {
 
     if (!ledgerName) {
       console.log("⚠️ Skipping ledger without name");
+      skipped++;
       continue;
     }
 
@@ -1016,6 +1471,7 @@ async function syncLedgers(company) {
 
     if (!ledgerGuid || !ledgerName) {
       console.log("⏭️ Skipping invalid ledger:", ledgerName);
+      skipped++;
       continue;
     }
 
@@ -1036,7 +1492,9 @@ async function syncLedgers(company) {
     });
   }
 
-  const synced = await upsertRows({
+  structuredLog("info", `[ledgers] VALIDATE: ${ledgerArray.length} fetched, ${skipped} skipped, ${ledgerRows.length} valid`);
+
+  const result = await writeRowsSafe({
     table: "ledgers",
     columns: [
       "company_guid",
@@ -1063,12 +1521,25 @@ async function syncLedgers(company) {
       "email",
       "pan",
       "payload"
-    ]
+    ],
+    entity: "ledgers",
+    idFn: (r) => r.ledger_guid
   });
 
   await cleanupByGuids("ledgers", company.company_guid, "ledger_guid", ledgerGuids);
-  await logSync("ledgers", synced);
-  console.log(`✅ Ledgers synced: ${synced}`);
+  await logSync("ledgers", result.synced);
+
+  recordEntityStats("ledgers", {
+    fetched: ledgerArray.length,
+    saved: result.synced,
+    failed: result.failed.length,
+    skipped
+  });
+
+  structuredLog("info", `[ledgers] COMPLETE: fetched=${ledgerArray.length} saved=${result.synced} failed=${result.failed.length} skipped=${skipped} remaining=0`, {
+    duration: formatDuration(Date.now() - t0)
+  });
+  console.log(`✅ Ledgers synced: ${result.synced}`);
 }
 
 // ============================================================
@@ -1076,13 +1547,36 @@ async function syncLedgers(company) {
 // ============================================================
 async function syncVouchers() {
   if (!ACTIVE_COMPANY_GUID) return;
+  const t0 = Date.now();
 
-  const voucherRows = [];
-  const invoiceRows = [];
-  const entryRows = [];
-  const voucherGuids = [];
+  const VOUCHER_WINDOW_DAYS = 5;
 
-  const xmlRequest = `
+  function getVoucherWindows(days = VOUCHER_WINDOW_DAYS) {
+    const now = new Date();
+    const fromYear = now.getFullYear() - 1;
+    const start = new Date(fromYear, 3, 1);
+    const windows = [];
+    const cur = new Date(start);
+    let guard = 0;
+    while (cur <= now && guard < 500) {
+      const from = new Date(cur);
+      const to = new Date(cur);
+      to.setDate(to.getDate() + days - 1);
+      if (to > now) to.setTime(now.getTime());
+      windows.push({
+        fromDate: fmtYMD(from),
+        toDate: fmtYMD(to),
+        label: `${from.getFullYear()}-${String(from.getMonth() + 1).padStart(2, "0")}-${String(from.getDate()).padStart(2, "0")}`
+      });
+      cur.setDate(cur.getDate() + days);
+      guard++;
+    }
+    return windows;
+  }
+
+  const chunks = getVoucherWindows();
+
+  const xmlTemplate = `
 <ENVELOPE>
  <HEADER>
   <VERSION>1</VERSION>
@@ -1095,6 +1589,8 @@ async function syncVouchers() {
    <STATICVARIABLES>
     <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
     <SVCURRENTCOMPANY>${ACTIVE_COMPANY_NAME}</SVCURRENTCOMPANY>
+    <SVFROMDATE>__FROM_DATE__</SVFROMDATE>
+    <SVTODATE>__TO_DATE__</SVTODATE>
    </STATICVARIABLES>
    <TDL>
     <TDLMESSAGE>
@@ -1117,17 +1613,17 @@ async function syncVouchers() {
  </BODY>
 </ENVELOPE>
 `;
-
-  const res = await axios.post(TALLY_URL, xmlRequest, {
-    headers: { "Content-Type": "text/xml" }
-  });
-
-  const parsed = await parseStringPromise(res.data);
-
-  const vouchers =
-    parsed?.ENVELOPE?.BODY?.[0]?.DATA?.[0]?.COLLECTION?.[0]?.VOUCHER || [];
-
-  const msgArray = Array.isArray(vouchers) ? vouchers : [vouchers];
+  let skipped = 0;
+  let totalFetched = 0;
+  const allVoucherGuids = [];
+  const stats = {
+    voucherSaved: 0,
+    voucherFailed: 0,
+    invoiceSaved: 0,
+    invoiceFailed: 0,
+    entrySaved: 0,
+    entryFailed: 0
+  };
 
   function extractValue(val) {
     if (!val) return null;
@@ -1136,11 +1632,18 @@ async function syncVouchers() {
     return null;
   }
 
-  for (const v of msgArray) {
-    const voucherGuid = extractValue(v.GUID?.[0]);
-    if (!voucherGuid) continue;
+  function fmtYMD(d) {
+    return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+  }
 
-    voucherGuids.push(voucherGuid);
+  function processVoucher(v, rows) {
+    const voucherGuid = extractValue(v.GUID?.[0]);
+    if (!voucherGuid) {
+      skipped++;
+      return;
+    }
+
+    rows.chunkGuids.push(voucherGuid);
 
     const rawDate = extractValue(v.DATE?.[0] || v.REFERENCEDATE?.[0]);
     const voucherDate = toISODate(rawDate);
@@ -1206,7 +1709,7 @@ async function syncVouchers() {
 
     const netAmount = Math.max(debitTotal, creditTotal);
 
-    voucherRows.push({
+    rows.voucherRows.push({
       company_guid: ACTIVE_COMPANY_GUID,
       voucher_guid: voucherGuid,
       voucher_date: voucherDate,
@@ -1216,7 +1719,7 @@ async function syncVouchers() {
       payload: v
     });
 
-    entryRows.push(...entries);
+    rows.entryRows.push(...entries);
 
     const isPurchase =
       voucherType && voucherType.toLowerCase().includes("purchase");
@@ -1226,7 +1729,7 @@ async function syncVouchers() {
         voucherType.toLowerCase().includes("invoice"));
 
     if (isPurchase || isSales) {
-      invoiceRows.push({
+      rows.invoiceRows.push({
         company_guid: ACTIVE_COMPANY_GUID,
         invoice_guid: voucherGuid,
         invoice_no: extractValue(v.VOUCHERNUMBER?.[0]),
@@ -1239,98 +1742,165 @@ async function syncVouchers() {
     }
   }
 
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
+  async function writeChunk(rows) {
+    if (!rows.chunkGuids.length) return;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
 
-    const voucherCount = await upsertRows({
-      table: "vouchers",
-      columns: [
-        "company_guid",
-        "voucher_guid",
-        "voucher_date",
-        "voucher_type",
-        "reference_no",
-        "net_amount",
-        "payload"
-      ],
-      rows: voucherRows,
-      conflict: ["company_guid", "voucher_guid"],
-      updateColumns: [
-        "voucher_date",
-        "voucher_type",
-        "reference_no",
-        "net_amount",
-        "payload"
-      ]
-    });
+      const voucherRes = await writeRowsSafe({
+        db: client,
+        inTx: true,
+        table: "vouchers",
+        columns: [
+          "company_guid",
+          "voucher_guid",
+          "voucher_date",
+          "voucher_type",
+          "reference_no",
+          "net_amount",
+          "payload"
+        ],
+        rows: rows.voucherRows,
+        conflict: ["company_guid", "voucher_guid"],
+        updateColumns: [
+          "voucher_date",
+          "voucher_type",
+          "reference_no",
+          "net_amount",
+          "payload"
+        ],
+        entity: "vouchers",
+        idFn: (r) => r.voucher_guid
+      });
 
-    const invoiceCount = await upsertRows({
-      table: "invoices",
-      columns: [
-        "company_guid",
-        "invoice_guid",
-        "invoice_no",
-        "invoice_date",
-        "invoice_type",
-        "party_name",
-        "total_amount",
-        "payload"
-      ],
-      rows: invoiceRows,
-      conflict: ["company_guid", "invoice_guid"],
-      updateColumns: [
-        "invoice_no",
-        "invoice_date",
-        "invoice_type",
-        "party_name",
-        "total_amount",
-        "payload"
-      ]
-    });
+      const invoiceRes = await writeRowsSafe({
+        db: client,
+        inTx: true,
+        table: "invoices",
+        columns: [
+          "company_guid",
+          "invoice_guid",
+          "invoice_no",
+          "invoice_date",
+          "invoice_type",
+          "party_name",
+          "total_amount",
+          "payload"
+        ],
+        rows: rows.invoiceRows,
+        conflict: ["company_guid", "invoice_guid"],
+        updateColumns: [
+          "invoice_no",
+          "invoice_date",
+          "invoice_type",
+          "party_name",
+          "total_amount",
+          "payload"
+        ],
+        entity: "invoices",
+        idFn: (r) => r.invoice_guid
+      });
 
-    // 🔥 Rebuild entries for the synced vouchers (no duplicates)
-    if (voucherGuids.length) {
+      // 🔥 Rebuild entries for the synced vouchers (no duplicates)
       await client.query(
         "DELETE FROM voucher_entries WHERE company_guid = $1 AND voucher_guid = ANY($2::text[])",
-        [ACTIVE_COMPANY_GUID, voucherGuids]
+        [ACTIVE_COMPANY_GUID, rows.chunkGuids]
       );
-    }
-    let entryCount = 0;
-    if (entryRows.length) {
-      const placeholders = entryRows
-        .map(
-          (_, i) =>
-            `($${i * 6 + 1}, $${i * 6 + 2}, $${i * 6 + 3}, $${i * 6 + 4}, $${i * 6 + 5}, $${i * 6 + 6})`
-        )
-        .join(",");
-      const values = entryRows.flatMap((r) => [
-        r.company_guid,
-        r.voucher_guid,
-        r.ledger_name,
-        r.amount,
-        r.is_debit,
-        r.payload
-      ]);
-      await client.query(
-        `INSERT INTO voucher_entries (company_guid, voucher_guid, ledger_name, amount, is_debit, payload)
-         VALUES ${placeholders}`,
-        values
-      );
-      entryCount = entryRows.length;
-    }
 
-    await cleanupByGuids("vouchers", ACTIVE_COMPANY_GUID, "voucher_guid", voucherGuids);
-    await client.query("COMMIT");
+      const entryRes = await writeRowsSafe({
+        db: client,
+        inTx: true,
+        table: "voucher_entries",
+        columns: ["company_guid", "voucher_guid", "ledger_name", "amount", "is_debit", "payload"],
+        rows: rows.entryRows,
+        entity: "voucher_entries",
+        idFn: (r) => `${r.voucher_guid}:${r.ledger_name}`
+      });
 
-    console.log(`✅ Vouchers: ${voucherCount} | Invoices: ${invoiceCount} | Entries: ${entryCount}`);
-    await logSync("vouchers", voucherCount);
-    await logSync("invoices", invoiceCount);
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
+      await client.query("COMMIT");
+
+      stats.voucherSaved += voucherRes.synced;
+      stats.voucherFailed += voucherRes.failed.length;
+      stats.invoiceSaved += invoiceRes.synced;
+      stats.invoiceFailed += invoiceRes.failed.length;
+      stats.entrySaved += entryRes.synced;
+      stats.entryFailed += entryRes.failed.length;
+
+      allVoucherGuids.push(...rows.chunkGuids);
+    } catch (err) {
+      await client.query("ROLLBACK");
+      structuredLog("error", "[vouchers] Chunk sync failed, transaction rolled back", {
+        error: err.message
+      });
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async function processDateRange(fromDate, toDate) {
+    const xmlRequest = xmlTemplate
+      .replace("__FROM_DATE__", fromDate)
+      .replace("__TO_DATE__", toDate);
+
+    const rows = { voucherRows: [], invoiceRows: [], entryRows: [], chunkGuids: [] };
+    let fetchedInWindow = 0;
+
+    const onVoucher = (v) => {
+      fetchedInWindow++;
+      totalFetched++;
+      processVoucher(v, rows);
+    };
+
+    const { bytes } = await fetchVouchersStream(xmlRequest, onVoucher);
+
+    await writeChunk(rows);
+
+    structuredLog("info", `[vouchers] WINDOW DONE: ${fromDate}-${toDate} fetched=${fetchedInWindow} valid=${rows.chunkGuids.length} skipped=${skipped} size=${fmtBytes(bytes)}`);
+  }
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    structuredLog("info", `[vouchers] FETCH: chunk ${chunk.label} (${i + 1}/${chunks.length}) ${chunk.fromDate}-${chunk.toDate}`);
+    await processDateRange(chunk.fromDate, chunk.toDate);
+    structuredLog("info", `[vouchers] WINDOW DONE: ${chunk.label} fetched=${totalFetched} skipped=${skipped}`);
+  }
+
+  structuredLog("info", `[vouchers] VALIDATE: ${totalFetched} fetched, ${skipped} skipped, ${allVoucherGuids.length} valid`);
+
+  if (allVoucherGuids.length) {
+    await cleanupByGuids("vouchers", ACTIVE_COMPANY_GUID, "voucher_guid", allVoucherGuids);
+  }
+
+  console.log(`✅ Vouchers: ${stats.voucherSaved} | Invoices: ${stats.invoiceSaved} | Entries: ${stats.entrySaved}`);
+  await logSync("vouchers", stats.voucherSaved);
+  await logSync("invoices", stats.invoiceSaved);
+
+  recordEntityStats("vouchers", {
+    fetched: totalFetched,
+    saved: stats.voucherSaved,
+    failed: stats.voucherFailed,
+    skipped
+  });
+  recordEntityStats("invoices", {
+    fetched: totalFetched,
+    saved: stats.invoiceSaved,
+    failed: stats.invoiceFailed,
+    skipped: 0
+  });
+  recordEntityStats("voucher_entries", {
+    fetched: totalFetched,
+    saved: stats.entrySaved,
+    failed: stats.entryFailed,
+    skipped: 0
+  });
+
+  structuredLog("info", `[vouchers] COMPLETE: fetched=${totalFetched} saved=${stats.voucherSaved} failed=${stats.voucherFailed} skipped=${skipped} remaining=0`, {
+    duration: formatDuration(Date.now() - t0)
+  });
+  if (stats.entryFailed) {
+    structuredLog("warn", `[voucher_entries] ${stats.entryFailed} entries failed and were logged for retry`);
   }
 }
 
@@ -1339,6 +1909,7 @@ async function syncVouchers() {
 // ============================================================
 async function syncBills() {
   if (!ACTIVE_COMPANY_GUID) return;
+  const t0 = Date.now();
 
   console.log("🧾 Syncing Bills Receivable...");
 
@@ -1364,9 +1935,7 @@ async function syncBills() {
 </ENVELOPE>
 `;
 
-  const res = await axios.post(TALLY_URL, xmlRequest, {
-    headers: { "Content-Type": "text/xml" }
-  });
+  const res = await fetchTallyXml(xmlRequest, { entity: "bills_receivable" });
 
   const parsed = await parseStringPromise(res.data);
   const envelope = parsed?.ENVELOPE || {};
@@ -1393,6 +1962,7 @@ async function syncBills() {
     : [];
 
   const rows = [];
+  let skipped = 0;
 
   for (let i = 0; i < billFixedArr.length; i++) {
     const bill = billFixedArr[i];
@@ -1401,7 +1971,10 @@ async function syncBills() {
     const billName = normalizeText(bill.BILLREF);
     const billDate = normalizeText(bill.BILLDATE);
 
-    if (!ledgerName || !billName) continue;
+    if (!ledgerName || !billName) {
+      skipped++;
+      continue;
+    }
 
     const pendingAmt = Math.abs(parseTallyNumber(billAmounts[i] || "0"));
     const dueDate = normalizeText(billDueArr[i] || null);
@@ -1429,7 +2002,9 @@ async function syncBills() {
     });
   }
 
-  const synced = await upsertRows({
+  structuredLog("info", `[bills_receivable] VALIDATE: ${billFixedArr.length} fetched, ${skipped} skipped, ${rows.length} valid`);
+
+  const result = await writeRowsSafe({
     table: "bills",
     columns: [
       "company_guid",
@@ -1455,11 +2030,24 @@ async function syncBills() {
       "overdue_days",
       "bill_type",
       "payload"
-    ]
+    ],
+    entity: "bills_receivable",
+    idFn: (r) => `${r.ledger_name}/${r.bill_name} (${r.bill_type})`
   });
 
-  await logSync("bills_receivable", synced);
-  console.log(`✅ Bills Receivable synced: ${synced}`);
+  await logSync("bills_receivable", result.synced);
+
+  recordEntityStats("bills_receivable", {
+    fetched: billFixedArr.length,
+    saved: result.synced,
+    failed: result.failed.length,
+    skipped
+  });
+
+  structuredLog("info", `[bills_receivable] COMPLETE: fetched=${billFixedArr.length} saved=${result.synced} failed=${result.failed.length} skipped=${skipped} remaining=0`, {
+    duration: formatDuration(Date.now() - t0)
+  });
+  console.log(`✅ Bills Receivable synced: ${result.synced}`);
 }
 
 // ============================================================
@@ -1467,6 +2055,7 @@ async function syncBills() {
 // ============================================================
 async function syncBillsPayable() {
   if (!ACTIVE_COMPANY_GUID) return;
+  const t0 = Date.now();
 
   console.log("🧾 Syncing Bills Payable...");
 
@@ -1491,9 +2080,7 @@ async function syncBillsPayable() {
 </ENVELOPE>
 `;
 
-  const res = await axios.post(TALLY_URL, xmlRequest, {
-    headers: { "Content-Type": "text/xml" }
-  });
+  const res = await fetchTallyXml(xmlRequest, { entity: "bills_payable" });
 
   const parsed = await parseStringPromise(res.data);
   const envelope = parsed?.ENVELOPE || {};
@@ -1515,6 +2102,7 @@ async function syncBillsPayable() {
     : [];
 
   const rows = [];
+  let skipped = 0;
 
   for (let i = 0; i < billFixedArr.length; i++) {
     const bill = billFixedArr[i];
@@ -1525,6 +2113,7 @@ async function syncBillsPayable() {
 
     if (!ledgerName || !billName) {
       console.log("⏭️ Skipping invalid payable bill:", bill);
+      skipped++;
       continue;
     }
 
@@ -1553,7 +2142,9 @@ async function syncBillsPayable() {
     });
   }
 
-  const synced = await upsertRows({
+  structuredLog("info", `[bills_payable] VALIDATE: ${billFixedArr.length} fetched, ${skipped} skipped, ${rows.length} valid`);
+
+  const result = await writeRowsSafe({
     table: "bills",
     columns: [
       "company_guid",
@@ -1578,11 +2169,24 @@ async function syncBillsPayable() {
       "due_date",
       "bill_type",
       "payload"
-    ]
+    ],
+    entity: "bills_payable",
+    idFn: (r) => `${r.ledger_name}/${r.bill_name} (${r.bill_type})`
   });
 
-  await logSync("bills_payable", synced);
-  console.log(`✅ Bills Payable synced: ${synced}`);
+  await logSync("bills_payable", result.synced);
+
+  recordEntityStats("bills_payable", {
+    fetched: billFixedArr.length,
+    saved: result.synced,
+    failed: result.failed.length,
+    skipped
+  });
+
+  structuredLog("info", `[bills_payable] COMPLETE: fetched=${billFixedArr.length} saved=${result.synced} failed=${result.failed.length} skipped=${skipped} remaining=0`, {
+    duration: formatDuration(Date.now() - t0)
+  });
+  console.log(`✅ Bills Payable synced: ${result.synced}`);
 }
 
 // ============================================================
@@ -1590,6 +2194,7 @@ async function syncBillsPayable() {
 // ============================================================
 async function syncOrders() {
   if (!ACTIVE_COMPANY_GUID) return;
+  const t0 = Date.now();
 
   const xml = `
 <ENVELOPE>
@@ -1635,9 +2240,7 @@ async function syncOrders() {
 </ENVELOPE>
 `;
 
-  const res = await axios.post(TALLY_URL, xml, {
-    headers: { "Content-Type": "text/xml" }
-  });
+  const res = await fetchTallyXml(xml, { entity: "orders" });
 
   if (DEBUG) console.log("📥 RAW ORDER XML:\n", res.data);
 
@@ -1652,11 +2255,15 @@ async function syncOrders() {
 
   const rows = [];
   const orderGuids = [];
+  let skipped = 0;
 
   for (const v of voucherArray) {
     const voucherType = v.VOUCHERTYPENAME?.[0];
     const orderGuid = v.GUID?.[0];
-    if (!orderGuid) continue;
+    if (!orderGuid) {
+      skipped++;
+      continue;
+    }
 
     orderGuids.push(orderGuid);
 
@@ -1672,7 +2279,9 @@ async function syncOrders() {
     });
   }
 
-  const synced = await upsertRows({
+  structuredLog("info", `[orders] VALIDATE: ${voucherArray.length} fetched, ${skipped} skipped, ${rows.length} valid`);
+
+  const result = await writeRowsSafe({
     table: "orders",
     columns: [
       "company_guid",
@@ -1693,12 +2302,25 @@ async function syncOrders() {
       "total_amount",
       "type",
       "payload"
-    ]
+    ],
+    entity: "orders",
+    idFn: (r) => r.order_guid
   });
 
   await cleanupByGuids("orders", ACTIVE_COMPANY_GUID, "order_guid", orderGuids);
-  await logSync("orders", synced);
-  console.log(`✅ Orders synced: ${synced}`);
+  await logSync("orders", result.synced);
+
+  recordEntityStats("orders", {
+    fetched: voucherArray.length,
+    saved: result.synced,
+    failed: result.failed.length,
+    skipped
+  });
+
+  structuredLog("info", `[orders] COMPLETE: fetched=${voucherArray.length} saved=${result.synced} failed=${result.failed.length} skipped=${skipped} remaining=0`, {
+    duration: formatDuration(Date.now() - t0)
+  });
+  console.log(`✅ Orders synced: ${result.synced}`);
 }
 
 // ============================================================
@@ -1706,6 +2328,7 @@ async function syncOrders() {
 // ============================================================
 async function fetchFullStockData() {
   if (!ACTIVE_COMPANY_GUID) return;
+  const t0 = Date.now();
 
   const xml = `
 <ENVELOPE>
@@ -1743,9 +2366,7 @@ async function fetchFullStockData() {
 </ENVELOPE>
 `;
 
-  const res = await axios.post(TALLY_URL, xml, {
-    headers: { "Content-Type": "text/xml" }
-  });
+  const res = await fetchTallyXml(xml, { entity: "inventory_items" });
 
   const parsed = await parseStringPromise(res.data);
 
@@ -1758,13 +2379,20 @@ async function fetchFullStockData() {
 
   const rows = [];
   const itemGuids = [];
+  let skipped = 0;
 
   for (const i of itemArray) {
     const itemName = normalizeText(i.NAME?.[0]) || i.$?.NAME || null;
-    if (!itemName) continue;
+    if (!itemName) {
+      skipped++;
+      continue;
+    }
 
     const itemGuid = normalizeText(i.GUID?.[0]) || i.$?.GUID || null;
-    if (!itemGuid) continue;
+    if (!itemGuid) {
+      skipped++;
+      continue;
+    }
 
     itemGuids.push(itemGuid);
 
@@ -1782,7 +2410,9 @@ async function fetchFullStockData() {
     });
   }
 
-  const synced = await upsertRows({
+  structuredLog("info", `[inventory_items] VALIDATE: ${itemArray.length} fetched, ${skipped} skipped, ${rows.length} valid`);
+
+  const result = await writeRowsSafe({
     table: "inventory_items",
     columns: [
       "company_guid",
@@ -1807,12 +2437,25 @@ async function fetchFullStockData() {
       "closing_qty",
       "closing_value",
       "payload"
-    ]
+    ],
+    entity: "inventory_items",
+    idFn: (r) => r.item_guid
   });
 
   await cleanupByGuids("inventory_items", ACTIVE_COMPANY_GUID, "item_guid", itemGuids);
-  await logSync("inventory_items", synced);
-  console.log(`✅ Full inventory synced: ${synced}`);
+  await logSync("inventory_items", result.synced);
+
+  recordEntityStats("inventory_items", {
+    fetched: itemArray.length,
+    saved: result.synced,
+    failed: result.failed.length,
+    skipped
+  });
+
+  structuredLog("info", `[inventory_items] COMPLETE: fetched=${itemArray.length} saved=${result.synced} failed=${result.failed.length} skipped=${skipped} remaining=0`, {
+    duration: formatDuration(Date.now() - t0)
+  });
+  console.log(`✅ Full inventory synced: ${result.synced}`);
 }
 
 // ============================================================
@@ -1820,6 +2463,7 @@ async function fetchFullStockData() {
 // ============================================================
 async function syncInventoryMovements() {
   if (!ACTIVE_COMPANY_GUID) return;
+  const t0 = Date.now();
 
   console.log("📦 Syncing Inventory Movements...");
 
@@ -1844,9 +2488,7 @@ async function syncInventoryMovements() {
 </ENVELOPE>
 `;
 
-  const res = await axios.post(TALLY_URL, xml, {
-    headers: { "Content-Type": "text/xml" }
-  });
+  const res = await fetchTallyXml(xml, { entity: "inventory_movements" });
 
   if (res.data.includes("<LINEERROR>")) {
     throw new Error("Inventory movement report error");
@@ -1864,15 +2506,22 @@ async function syncInventoryMovements() {
 
   const rows = [];
   const seen = new Set();
+  let skipped = 0;
 
   for (const msg of msgArray) {
     const v = msg.VOUCHER?.[0];
-    if (!v) continue;
+    if (!v) {
+      skipped++;
+      continue;
+    }
 
     const voucherType = v.VOUCHERTYPENAME?.[0];
     const voucherDate = toISODate(v.DATE?.[0]);
 
-    if (!["Sales", "Purchase"].includes(voucherType)) continue;
+    if (!["Sales", "Purchase"].includes(voucherType)) {
+      skipped++;
+      continue;
+    }
 
     const invEntries = [
       ...(Array.isArray(v["ALLINVENTORYENTRIES.LIST"])
@@ -1929,7 +2578,9 @@ async function syncInventoryMovements() {
     }
   }
 
-  const synced = await upsertRows({
+  structuredLog("info", `[inventory_movements] VALIDATE: ${msgArray.length} fetched, ${skipped} skipped, ${rows.length} valid`);
+
+  const result = await writeRowsSafe({
     table: "inventory_movements",
     columns: [
       "company_guid",
@@ -1950,11 +2601,24 @@ async function syncInventoryMovements() {
       "voucher_type",
       "voucher_date",
       "payload"
-    ]
+    ],
+    entity: "inventory_movements",
+    idFn: (r) => r.source_hash
   });
 
-  await logSync("inventory_movements", synced);
-  console.log(`✅ Inventory movements synced: ${synced}`);
+  await logSync("inventory_movements", result.synced);
+
+  recordEntityStats("inventory_movements", {
+    fetched: msgArray.length,
+    saved: result.synced,
+    failed: result.failed.length,
+    skipped
+  });
+
+  structuredLog("info", `[inventory_movements] COMPLETE: fetched=${msgArray.length} saved=${result.synced} failed=${result.failed.length} skipped=${skipped} remaining=0`, {
+    duration: formatDuration(Date.now() - t0)
+  });
+  console.log(`✅ Inventory movements synced: ${result.synced}`);
 }
 
 // ============================================================
@@ -1962,6 +2626,7 @@ async function syncInventoryMovements() {
 // ============================================================
 async function syncProfitLossMonthly() {
   if (!ACTIVE_COMPANY_GUID) return;
+  const t0 = Date.now();
 
   console.log("📊 Syncing Monthly Profit & Loss...");
 
@@ -1999,8 +2664,9 @@ async function syncProfitLossMonthly() {
 `;
 
       try {
-        const res = await axios.post(TALLY_URL, xmlRequest, {
-          headers: { "Content-Type": "text/xml" }
+        const res = await fetchTallyXml(xmlRequest, {
+          entity: "profit_loss",
+          timeout: 120000
         });
 
         if (res.data.includes("<LINEERROR>")) {
@@ -2043,7 +2709,7 @@ async function syncProfitLossMonthly() {
           }
         ];
 
-        const synced = await upsertRows({
+        const result = await writeRowsSafe({
           table: "profit_loss",
           columns: [
             "company_guid",
@@ -2056,10 +2722,12 @@ async function syncProfitLossMonthly() {
           ],
           rows,
           conflict: ["company_guid", "month"],
-          updateColumns: ["from_date", "to_date", "net_amount", "type", "payload"]
+          updateColumns: ["from_date", "to_date", "net_amount", "type", "payload"],
+          entity: "profit_loss",
+          idFn: (r) => r.month
         });
 
-        await logSync("profit_loss", synced);
+        await logSync("profit_loss", result.synced);
       } catch (err) {
         console.error("❌ P&L sync error:", err.message);
       }
@@ -2067,6 +2735,7 @@ async function syncProfitLossMonthly() {
   }
 
   console.log("✅ Profit & Loss Monthly Sync Complete");
+  structuredLog("info", `[profit_loss] COMPLETE: duration=${formatDuration(Date.now() - t0)}`);
 }
 
 // ============================================================
@@ -2079,11 +2748,30 @@ async function syncAllData(companies) {
   }
 
   isSyncRunning = true;
+  const syncStart = Date.now();
+  SYNC_RUN_ID = new Date().toISOString().replace(/[:.]/g, "-");
+  SYNC_SUMMARY.startedAt = new Date();
+  SYNC_SUMMARY.endedAt = null;
+  SYNC_SUMMARY.companiesSynced = 0;
+  SYNC_SUMMARY.entities = {};
+
+  structuredLog("info", "Sync started", { companies: companies.length });
   console.log("🔄 Sync started...");
 
   try {
+    recordEntityStats("companies", {
+      fetched: companies.length,
+      saved: companies.length,
+      failed: 0,
+      skipped: 0
+    });
+
     for (const company of companies) {
+      const companyStart = Date.now();
       console.log("\n🔐 Syncing company:", company.name);
+      structuredLog("info", `[company] Sync started: ${company.name}`, {
+        companyGuid: company.company_guid
+      });
 
       ACTIVE_COMPANY_GUID = company.company_guid;
       ACTIVE_COMPANY_NAME = company.name;
@@ -2110,11 +2798,21 @@ async function syncAllData(companies) {
       // console.log("➡️ STEP 7: syncProfitLossMonthly");
       // await syncProfitLossMonthly();
 
+      structuredLog("info", `[company] Sync completed: ${company.name}`, {
+        duration: formatDuration(Date.now() - companyStart)
+      });
       console.log(`✅ Sync completed for ${company.name}`);
+      SYNC_SUMMARY.companiesSynced++;
     }
+
+    SYNC_SUMMARY.endedAt = new Date();
+    printSyncSummary(syncStart);
 
     console.log("\n✅ Sync complete!");
   } catch (err) {
+    SYNC_SUMMARY.endedAt = new Date();
+    printSyncSummary(syncStart);
+    structuredLog("error", "Sync FAILED", { error: err.message, stack: err.stack });
     console.error("⛔ SYNC FAILED");
     console.error("MESSAGE:", err.message);
   } finally {
@@ -2168,6 +2866,8 @@ async function selectCompanies(allCompanies) {
 // ============================================================
 async function runSyncFlow() {
   try {
+    SYNC_RUN_ID = new Date().toISOString().replace(/[:.]/g, "-");
+
     // Step 1: Detect companies + auto-create in DB
     const companies = await detectCompanies();
 
