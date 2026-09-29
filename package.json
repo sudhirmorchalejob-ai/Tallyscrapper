@@ -1,0 +1,27 @@
+{
+  "name": "Tally-Connect",
+  "version": "1.0.0",
+  "description": "Tally Desktop Sync Agent",
+  "bin": "agent.cjs",
+  "scripts": {
+    "start": "node agent.cjs",
+    "build": "pkg . --options max-old-space-size=4096"
+  },
+  "pkg": {
+    "targets": [
+      "node18-win-x64"
+    ],
+    "outputPath": "dist"
+  },
+  "dependencies": {
+    "agentkeepalive": "^4.6.0",
+    "axios": "0.27.2",
+    "dotenv": "^17.4.2",
+    "pg": "^8.22.0",
+    "sax": "^1.4.1",
+    "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  }
+}
